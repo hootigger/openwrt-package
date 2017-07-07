@@ -1,0 +1,35 @@
+--- a/auto/types/sizeof
++++ b/auto/types/sizeof
+@@ -12,7 +12,7 @@ checking for $ngx_type size
+ 
+ END
+ 
+-ngx_size=
++ngx_size=4
+ 
+ cat << END > $NGX_AUTOTEST.c
+ 
+@@ -25,15 +25,21 @@ $NGX_INCLUDE_UNISTD_H
+ $NGX_INCLUDE_INTTYPES_H
+ $NGX_INCLUDE_AUTO_CONFIG_H
+ 
++char object_code_block[] = {
++	'\n', 'e', '4', 'V', 'A',
++	'0', 'x', ('0' + sizeof($ngx_type)),
++	'Y', '3', 'p', 'M', '\n'
++};
++
+ int main() {
+-    printf("%d", (int) sizeof($ngx_type));
++    printf("dummy use of object_code_block to avoid gc-section: %c", object_code_block[0]);
+     return 0;
+ }
+ 
+ END
+ 
+ 
+-ngx_test="$CC $CC_TEST_FLAGS $CC_AUX_FLAGS \
++ngx_test="$gcc $CC_TEST_FLAGS $CC_AUX_FLAGS \
+           -o $NGX_AUTOTEST $NGX_AUTOTEST.c $NGX_LD_OPT $ngx_feature_libs"
+ 
+ eval "$ngx_test >> $NGX_AUTOCONF_ERR 2>&1"
