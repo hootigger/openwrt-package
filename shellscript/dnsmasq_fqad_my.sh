@@ -279,9 +279,9 @@ echo
 echo -e -n "\e[1;36m 请输入更新时间(整点小时): \e[0m" 
 read timedata
 echo
-echo "[$USER@$HOSTNAME:/$USER]#cat /etc/crontabs/$USER
-# 每天$timedata点28分更新dnsmasq和hosts规则
-28 $timedata * * * /bin/sh /etc/dnsmasq/fqad_update.sh > /dev/null 2>&1
+#echo "[$USER@$HOSTNAME:/$USER]#cat /etc/crontabs/$USER
+echo "# 每天$timedata点28分更新dnsmasq和hosts规则
+28 $timedata * * * /bin/sh /etc/guogh/dnsmasq_fqad_update.sh > /dev/null 2>&1
 #/tmp/fqad_update.log 2>&1" >> $CRON_FILE
 /etc/init.d/cron reload
 echo -e "\e[1;36m 定时计划任务添加完成！\e[0m"
