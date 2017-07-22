@@ -229,8 +229,6 @@ define Build/Configure
 			--with-http_sub_module \
 			--with-http_mp4_module \
 			--with-http_auth_request_module \
-			--with-http_stub_status_module \
-			--with-http_secure_link_module \
 			--with-stream \
 			--with-stream_ssl_module \
 			--with-debug \
