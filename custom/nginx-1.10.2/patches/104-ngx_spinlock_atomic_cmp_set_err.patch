@@ -1,0 +1,31 @@
+--- a/src/core/ngx_rwlock.c
++++ b/src/core/ngx_rwlock.c
+@@ -9,7 +9,7 @@
+ #include <ngx_core.h>
+ 
+ 
+-#if (NGX_HAVE_ATOMIC_OPS)
++#if (!NGX_HAVE_ATOMIC_OPS)
+ 
+ 
+ #define NGX_RWLOCK_SPIN   2048
+@@ -113,7 +113,7 @@ ngx_rwlock_unlock(ngx_atomic_t *lock)
+ 
+ #if (NGX_HTTP_UPSTREAM_ZONE || NGX_STREAM_UPSTREAM_ZONE)
+ 
+-#error ngx_atomic_cmp_set() is not defined!
++//#error ngx_atomic_cmp_set() is not defined!
+ 
+ #endif
+ 
+--- a/src/core/ngx_spinlock.c
++++ b/src/core/ngx_spinlock.c
+@@ -44,7 +44,7 @@ ngx_spinlock(ngx_atomic_t *lock, ngx_ato
+ 
+ #if (NGX_THREADS)
+ 
+-#error ngx_spinlock() or ngx_atomic_cmp_set() are not defined !
++//#error ngx_spinlock() or ngx_atomic_cmp_set() are not defined !
+ 
+ #endif
+ 

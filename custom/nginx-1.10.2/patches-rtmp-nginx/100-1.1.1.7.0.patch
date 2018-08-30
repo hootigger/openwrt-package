@@ -1,0 +1,2938 @@
+diff --git a/.gitignore b/.gitignore
+index 4de62e11..5030bb87 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -2,3 +2,4 @@
+ /.settings
+ /.project
+ /.cproject
++/.vscode
+diff --git a/README.md b/README.md
+index f8dd9e38..d53d0e6b 100644
+--- a/README.md
++++ b/README.md
+@@ -91,6 +91,12 @@ For building debug version of nginx add `--with-debug`
+ 
+ [Read more about debug log](https://github.com/arut/nginx-rtmp-module/wiki/Debug-log)
+ 
++### Contributing and Branch Policy
++
++The "dev" branch is the one where all contributions will be merged before reaching "master".
++If you plan to propose a patch, please commit into the "dev" branch or its own feature branch.
++Direct commit to "master" are not permitted.
++
+ ### Windows limitations
+ 
+ Windows support is limited. These features are not supported
+@@ -112,10 +118,8 @@ name - interpreted by each application
+ 
+ ### Multi-worker live streaming
+ 
+-Module supports multi-worker live
+-streaming through automatic stream pushing
+-to nginx workers. This option is toggled with
+-rtmp_auto_push directive.
++This NGINX-RTMP module does not support multi-worker live
++streaming. While this feature can be enabled through rtmp_auto_push on|off directive, it is ill advised because it is incompatible with NGINX versions starting 1.7.2 and up, there for it should not be used.
+ 
+ 
+ ### Example nginx.conf
+@@ -330,18 +334,3 @@ rtmp_auto_push directive.
+             }
+         }
+     }
+-
+-
+-### Multi-worker streaming example
+-
+-    rtmp_auto_push on;
+-
+-    rtmp {
+-        server {
+-            listen 1935;
+-
+-            application mytv {
+-                live on;
+-            }
+-        }
+-    }
+diff --git a/config b/config
+index cc4f2a30..13f00e83 100644
+--- a/config
++++ b/config
+@@ -14,6 +14,7 @@ RTMP_CORE_MODULES="                                         \
+                 ngx_rtmp_relay_module                       \
+                 ngx_rtmp_exec_module                        \
+                 ngx_rtmp_auto_push_module                   \
++                ngx_rtmp_auto_push_index_module             \
+                 ngx_rtmp_notify_module                      \
+                 ngx_rtmp_log_module                         \
+                 ngx_rtmp_limit_module                       \
+@@ -75,6 +76,7 @@ RTMP_CORE_SRCS="                                            \
+                 $ngx_addon_dir/hls/ngx_rtmp_hls_module.c    \
+                 $ngx_addon_dir/dash/ngx_rtmp_dash_module.c  \
+                 $ngx_addon_dir/hls/ngx_rtmp_mpegts.c        \
++                $ngx_addon_dir/hls/ngx_rtmp_mpegts_crc.c    \
+                 $ngx_addon_dir/dash/ngx_rtmp_mp4.c          \
+                 "
+ RTMP_HTTP_SRCS="                                            \
+@@ -88,7 +90,7 @@ if [ "$ngx_module_link" = "" ] ; then
+ 	# Old nginx version
+ 	ngx_module_link=NONE
+ 
+-	CORE_MODULES="$CORE_MODULES $RTMP_CORE_MODULES"
++	EVENT_MODULES="$EVENT_MODULES $RTMP_CORE_MODULES"
+ 	HTTP_MODULES="$HTTP_MODULES $RTMP_HTTP_MODULES"
+ 	NGX_ADDON_DEPS="$NGX_ADDON_DEPS $RTMP_DEPS"
+ 	NGX_ADDON_SRCS="$NGX_ADDON_SRCS $RTMP_CORE_SRCS $RTMP_HTTP_SRCS"
+@@ -99,7 +101,7 @@ if [ $ngx_module_link = DYNAMIC ] ; then
+     ngx_module_srcs="$RTMP_CORE_SRCS $RTMP_HTTP_SRCS"
+     . auto/module
+ elif [ $ngx_module_link = ADDON ] ; then
+-    ngx_module_type=CORE
++    ngx_module_type=EVENT
+     ngx_module_name=$RTMP_CORE_MODULES
+     ngx_module_srcs=$RTMP_CORE_SRCS
+     . auto/module
+diff --git a/dash/ngx_rtmp_dash_module.c b/dash/ngx_rtmp_dash_module.c
+index 1dd27ce9..13d6572d 100644
+--- a/dash/ngx_rtmp_dash_module.c
++++ b/dash/ngx_rtmp_dash_module.c
+@@ -20,6 +20,7 @@ static void * ngx_rtmp_dash_create_app_conf(ngx_conf_t *cf);
+ static char * ngx_rtmp_dash_merge_app_conf(ngx_conf_t *cf,
+        void *parent, void *child);
+ static ngx_int_t ngx_rtmp_dash_write_init_segments(ngx_rtmp_session_t *s);
++static ngx_int_t ngx_rtmp_dash_ensure_directory(ngx_rtmp_session_t *s);
+ 
+ 
+ #define NGX_RTMP_DASH_BUFSIZE           (1024*1024)
+@@ -27,6 +28,7 @@ static ngx_int_t ngx_rtmp_dash_write_init_segments(ngx_rtmp_session_t *s);
+ #define NGX_RTMP_DASH_MAX_SAMPLES       1024
+ #define NGX_RTMP_DASH_DIR_ACCESS        0744
+ 
++#define NGX_RTMP_DASH_GMT_LENGTH        sizeof("1970-09-28T12:00:00+06:00")
+ 
+ typedef struct {
+     uint32_t                            timestamp;
+@@ -79,11 +81,29 @@ typedef struct {
+ } ngx_rtmp_dash_cleanup_t;
+ 
+ 
++#define NGX_RTMP_DASH_CLOCK_COMPENSATION_OFF       1
++#define NGX_RTMP_DASH_CLOCK_COMPENSATION_NTP       2
++#define NGX_RTMP_DASH_CLOCK_COMPENSATION_HTTP_HEAD 3
++#define NGX_RTMP_DASH_CLOCK_COMPENSATION_HTTP_ISO  4
++
++static ngx_conf_enum_t                  ngx_rtmp_dash_clock_compensation_type_slots[] = {
++    { ngx_string("off"),                NGX_RTMP_DASH_CLOCK_COMPENSATION_OFF },
++    { ngx_string("ntp"),                NGX_RTMP_DASH_CLOCK_COMPENSATION_NTP },
++    { ngx_string("http_head"),          NGX_RTMP_DASH_CLOCK_COMPENSATION_HTTP_HEAD },
++    { ngx_string("http_iso"),           NGX_RTMP_DASH_CLOCK_COMPENSATION_HTTP_ISO },
++    { ngx_null_string,                  0 }
++};
++
+ typedef struct {
+     ngx_flag_t                          dash;
+     ngx_msec_t                          fraglen;
+     ngx_msec_t                          playlen;
+     ngx_flag_t                          nested;
++    ngx_uint_t                          clock_compensation;     // Try to compensate clock drift
++                                                                //  between client and server (on client side)
++    ngx_str_t                           clock_helper_uri;       // Use uri to static file on HTTP server
++                                                                // - same machine as RTMP/DASH)
++                                                                // - or NTP server address
+     ngx_str_t                           path;
+     ngx_uint_t                          winfrags;
+     ngx_flag_t                          cleanup;
+@@ -135,6 +155,20 @@ static ngx_command_t ngx_rtmp_dash_commands[] = {
+       offsetof(ngx_rtmp_dash_app_conf_t, nested),
+       NULL },
+ 
++    { ngx_string("dash_clock_compensation"),
++      NGX_RTMP_MAIN_CONF|NGX_RTMP_SRV_CONF|NGX_RTMP_APP_CONF|NGX_CONF_TAKE1,
++      ngx_conf_set_enum_slot,
++      NGX_RTMP_APP_CONF_OFFSET,
++      offsetof(ngx_rtmp_dash_app_conf_t, clock_compensation),
++      &ngx_rtmp_dash_clock_compensation_type_slots },
++
++    { ngx_string("dash_clock_helper_uri"),
++      NGX_RTMP_MAIN_CONF|NGX_RTMP_SRV_CONF|NGX_RTMP_APP_CONF|NGX_CONF_TAKE1,
++      ngx_conf_set_str_slot,
++      NGX_RTMP_APP_CONF_OFFSET,
++      offsetof(ngx_rtmp_dash_app_conf_t, clock_helper_uri),
++      NULL },
++
+     ngx_null_command
+ };
+ 
+@@ -213,6 +247,22 @@ ngx_rtmp_dash_rename_file(u_char *src, u_char *dst)
+ }
+ 
+ 
++static ngx_uint_t
++ngx_rtmp_dash_gcd(ngx_uint_t m, ngx_uint_t n)
++{
++    /* greatest common divisor */
++
++    ngx_uint_t   temp;
++
++    while (n) {
++        temp=n;
++        n=m % n;
++        m=temp;
++    }
++    return m;
++}
++
++
+ static ngx_int_t
+ ngx_rtmp_dash_write_playlist(ngx_rtmp_session_t *s)
+ {
+@@ -223,7 +273,11 @@ ngx_rtmp_dash_write_playlist(ngx_rtmp_session_t *s)
+     struct tm                  tm;
+     ngx_str_t                  noname, *name;
+     ngx_uint_t                 i, frame_rate_num, frame_rate_denom;
+-    ngx_uint_t                 depth_msec;
++    ngx_uint_t                 depth_msec, depth_sec;
++    ngx_uint_t                 update_period, update_period_msec;
++    ngx_uint_t                 buffer_time, buffer_time_msec;
++    ngx_uint_t                 presentation_delay, presentation_delay_msec;
++    ngx_uint_t                 gcd, par_x, par_y;
+     ngx_rtmp_dash_ctx_t       *ctx;
+     ngx_rtmp_codec_ctx_t      *codec_ctx;
+     ngx_rtmp_dash_frag_t      *f;
+@@ -232,9 +286,9 @@ ngx_rtmp_dash_write_playlist(ngx_rtmp_session_t *s)
+     ngx_rtmp_playlist_t        v;
+ 
+     static u_char              buffer[NGX_RTMP_DASH_BUFSIZE];
+-    static u_char              start_time[sizeof("1970-09-28T12:00:00+06:00")];
+-    static u_char              end_time[sizeof("1970-09-28T12:00:00+06:00")];
+-    static u_char              buffer_depth[sizeof("P00Y00M00DT00H00M00.00S")];
++    static u_char              avaliable_time[NGX_RTMP_DASH_GMT_LENGTH];
++    static u_char              publish_time[NGX_RTMP_DASH_GMT_LENGTH];
++    static u_char              buffer_depth[sizeof("P00Y00M00DT00H00M00.000S")];
+     static u_char              frame_rate[(NGX_INT_T_LEN * 2) + 2];
+ 
+     dacf = ngx_rtmp_get_module_app_conf(s, ngx_rtmp_dash_module);
+@@ -265,25 +319,29 @@ ngx_rtmp_dash_write_playlist(ngx_rtmp_session_t *s)
+     "    type=\"dynamic\"\n"                                                   \
+     "    xmlns=\"urn:mpeg:dash:schema:mpd:2011\"\n"                            \
+     "    availabilityStartTime=\"%s\"\n"                                       \
+-    "    availabilityEndTime=\"%s\"\n"                                         \
+-    "    minimumUpdatePeriod=\"PT%uiS\"\n"                                     \
+-    "    minBufferTime=\"PT%uiS\"\n"                                           \
++    "    publishTime=\"%s\"\n"                                                 \
++    "    minimumUpdatePeriod=\"PT%ui.%03uiS\"\n"                               \
++    "    minBufferTime=\"PT%ui.%03uiS\"\n"                                     \
+     "    timeShiftBufferDepth=\"%s\"\n"                                        \
+-    "    suggestedPresentationDelay=\"PT%uiS\"\n"                              \
++    "    suggestedPresentationDelay=\"PT%ui.%03uiS\"\n"                        \
+     "    profiles=\"urn:hbbtv:dash:profile:isoff-live:2012,"                   \
+                    "urn:mpeg:dash:profile:isoff-live:2011\"\n"                 \
+     "    xmlns:xsi=\"http://www.w3.org/2011/XMLSchema-instance\"\n"            \
+-    "    xsi:schemaLocation=\"urn:mpeg:DASH:schema:MPD:2011 DASH-MPD.xsd\">\n" \
++    "    xsi:schemaLocation=\"urn:mpeg:DASH:schema:MPD:2011 DASH-MPD.xsd\">\n"
++
++#define NGX_RTMP_DASH_MANIFEST_PERIOD                                          \
+     "  <Period start=\"PT0S\" id=\"dash\">\n"
+ 
+ 
+ #define NGX_RTMP_DASH_MANIFEST_VIDEO                                           \
+     "    <AdaptationSet\n"                                                     \
+     "        id=\"1\"\n"                                                       \
++    "        startWithSAP=\"1\"\n"                                             \
+     "        segmentAlignment=\"true\"\n"                                      \
+     "        maxWidth=\"%ui\"\n"                                               \
+     "        maxHeight=\"%ui\"\n"                                              \
+-    "        maxFrameRate=\"%s\">\n"                                           \
++    "        maxFrameRate=\"%s\"\n"                                            \
++    "        par=\"%ui:%ui\">\n"                                               \
+     "      <Representation\n"                                                  \
+     "          id=\"%V_H264\"\n"                                               \
+     "          mimeType=\"video/mp4\"\n"                                       \
+@@ -292,7 +350,6 @@ ngx_rtmp_dash_write_playlist(ngx_rtmp_session_t *s)
+     "          height=\"%ui\"\n"                                               \
+     "          frameRate=\"%s\"\n"                                             \
+     "          sar=\"1:1\"\n"                                                  \
+-    "          startWithSAP=\"1\"\n"                                           \
+     "          bandwidth=\"%ui\">\n"                                           \
+     "        <SegmentTemplate\n"                                               \
+     "            presentationTimeOffset=\"0\"\n"                               \
+@@ -316,6 +373,7 @@ ngx_rtmp_dash_write_playlist(ngx_rtmp_session_t *s)
+ #define NGX_RTMP_DASH_MANIFEST_AUDIO                                           \
+     "    <AdaptationSet\n"                                                     \
+     "        id=\"2\"\n"                                                       \
++    "        startWithSAP=\"1\"\n"                                             \
+     "        segmentAlignment=\"true\">\n"                                     \
+     "      <AudioChannelConfiguration\n"                                       \
+     "          schemeIdUri=\"urn:mpeg:dash:"                                   \
+@@ -326,7 +384,6 @@ ngx_rtmp_dash_write_playlist(ngx_rtmp_session_t *s)
+     "          mimeType=\"audio/mp4\"\n"                                       \
+     "          codecs=\"mp4a.%s\"\n"                                           \
+     "          audioSamplingRate=\"%ui\"\n"                                    \
+-    "          startWithSAP=\"1\"\n"                                           \
+     "          bandwidth=\"%ui\">\n"                                           \
+     "        <SegmentTemplate\n"                                               \
+     "            presentationTimeOffset=\"0\"\n"                               \
+@@ -343,56 +400,101 @@ ngx_rtmp_dash_write_playlist(ngx_rtmp_session_t *s)
+     "    </AdaptationSet>\n"
+ 
+ 
++#define NGX_RTMP_DASH_PERIOD_FOOTER                                          \
++    "  </Period>\n"
++
++
++#define NGX_RTMP_DASH_MANIFEST_CLOCK                                           \
++    "  <UTCTiming schemeIdUri=\"urn:mpeg:dash:utc:%s:2014\"\n"                 \
++    "       value=\"%V\" />\n"
++
++
+ #define NGX_RTMP_DASH_MANIFEST_FOOTER                                          \
+-    "  </Period>\n"                                                            \
+     "</MPD>\n"
+ 
+-    ngx_libc_localtime(ctx->start_time.sec, &tm);
+ 
+-    *ngx_sprintf(start_time, "%4d-%02d-%02dT%02d:%02d:%02d%c%02d:%02d",
+-                 tm.tm_year + 1900, tm.tm_mon + 1,
+-                 tm.tm_mday, tm.tm_hour,
+-                 tm.tm_min, tm.tm_sec,
+-                 ctx->start_time.gmtoff < 0 ? '-' : '+',
+-                 ngx_abs(ctx->start_time.gmtoff / 60),
+-                 ngx_abs(ctx->start_time.gmtoff % 60)) = 0;
+-
+-    ngx_libc_localtime(ctx->start_time.sec +
+-                       (ngx_rtmp_dash_get_frag(s, ctx->nfrags - 1)->timestamp +
+-                        ngx_rtmp_dash_get_frag(s, ctx->nfrags - 1)->duration) /
+-                       1000, &tm);
+-
+-    *ngx_sprintf(end_time, "%4d-%02d-%02dT%02d:%02d:%02d%c%02d:%02d",
+-                 tm.tm_year + 1900, tm.tm_mon + 1,
+-                 tm.tm_mday, tm.tm_hour,
+-                 tm.tm_min, tm.tm_sec,
+-                 ctx->start_time.gmtoff < 0 ? '-' : '+',
+-                 ngx_abs(ctx->start_time.gmtoff / 60),
+-                 ngx_abs(ctx->start_time.gmtoff % 60)) = 0;
++/**
++ * Availability time must be equal stream start time
++ * Cos segments time counting from it
++ */
++    ngx_libc_gmtime(ctx->start_time.sec, &tm);
++    *ngx_sprintf(avaliable_time, "%4d-%02d-%02dT%02d:%02d:%02dZ",
++             tm.tm_year + 1900, tm.tm_mon + 1,
++             tm.tm_mday, tm.tm_hour,
++             tm.tm_min, tm.tm_sec
++             ) = 0;
+ 
+-    
+-    depth_msec = (ngx_uint_t) (
++    /* Stream publish time */
++    *ngx_sprintf(publish_time, "%s", avaliable_time) = 0;
++
++    depth_sec = (ngx_uint_t) (
+                  ngx_rtmp_dash_get_frag(s, ctx->nfrags - 1)->timestamp +
+                  ngx_rtmp_dash_get_frag(s, ctx->nfrags - 1)->duration - 
+                  ngx_rtmp_dash_get_frag(s, 0)->timestamp);
+ 
+-    ngx_libc_gmtime((ngx_uint_t) (depth_msec / 1000), &tm);
++    depth_msec = depth_sec % 1000;
++    depth_sec -= depth_msec;
++    depth_sec /= 1000;
++
++    ngx_libc_gmtime(depth_sec, &tm);
+ 
+-    *ngx_sprintf(buffer_depth, "P%dY%02dM%02dDT%dH%02dM%02d.%02dS",
++    *ngx_sprintf(buffer_depth, "P%dY%02dM%02dDT%dH%02dM%02d.%03dS",
+                  tm.tm_year - 70, tm.tm_mon,
+                  tm.tm_mday - 1, tm.tm_hour,
+                  tm.tm_min, tm.tm_sec,
+-                 (ngx_uint_t) ((depth_msec % 1000) / 10)) = 0;
++                 depth_msec) = 0;
+ 
+     last = buffer + sizeof(buffer);
+ 
++    /**
++     * Calculate playlist minimal update period
++     * This should be more than biggest segment duration
++     * Cos segments rounded by keyframe/GOP.
++     * And that time not always equals to fragment length.
++     */
++    update_period = dacf->fraglen;
++
++    for (i = 0; i < ctx->nfrags; i++) {
++        f = ngx_rtmp_dash_get_frag(s, i);
++        if (f->duration > update_period) {
++            update_period = f->duration;
++        }
++    }
++
++    // Reasonable delay for streaming
++    presentation_delay = update_period * 2 + 1000;
++    presentation_delay_msec = presentation_delay % 1000;
++    presentation_delay -= presentation_delay_msec;
++    presentation_delay /= 1000;
++
++    // Calculate msec part and seconds
++    update_period_msec = update_period % 1000;
++    update_period -= update_period_msec;
++    update_period /= 1000;
++
++    // Buffer length by default fragment length
++    buffer_time = dacf->fraglen;
++    buffer_time_msec = buffer_time % 1000;
++    buffer_time -= buffer_time_msec;
++    buffer_time /= 1000;
++
++    // Fill DASH header
+     p = ngx_slprintf(buffer, last, NGX_RTMP_DASH_MANIFEST_HEADER,
+-                     start_time,
+-                     end_time,
+-                     (ngx_uint_t) (dacf->fraglen / 1000),
+-                     (ngx_uint_t) (dacf->fraglen / 1000),
++                     // availabilityStartTime
++                     avaliable_time,
++                     // publishTime
++                     publish_time,
++                     // minimumUpdatePeriod
++                     update_period, update_period_msec,
++                     // minBufferTime
++                     buffer_time, buffer_time_msec,
++                     // timeShiftBufferDepth
+                      buffer_depth,
+-                     (ngx_uint_t) (dacf->fraglen / 500));
++                     // suggestedPresentationDelay
++                     presentation_delay, presentation_delay_msec
++                     );
++
++    p = ngx_slprintf(p, last, NGX_RTMP_DASH_MANIFEST_PERIOD);
+ 
+     n = ngx_write_fd(fd, buffer, p - buffer);
+ 
+@@ -426,10 +528,15 @@ ngx_rtmp_dash_write_playlist(ngx_rtmp_session_t *s)
+             *ngx_sprintf(frame_rate, "%ui/%ui", frame_rate_num, frame_rate_denom) = 0;
+         }
+ 
++        gcd = ngx_rtmp_dash_gcd(codec_ctx->width, codec_ctx->height);
++        par_x = codec_ctx->width / gcd;
++        par_y = codec_ctx->height / gcd;
++
+         p = ngx_slprintf(buffer, last, NGX_RTMP_DASH_MANIFEST_VIDEO,
+                          codec_ctx->width,
+                          codec_ctx->height,
+                          frame_rate,
++                         par_x, par_y,
+                          &ctx->name,
+                          codec_ctx->avc_profile,
+                          codec_ctx->avc_compat,
+@@ -473,6 +580,34 @@ ngx_rtmp_dash_write_playlist(ngx_rtmp_session_t *s)
+         n = ngx_write_fd(fd, buffer, p - buffer);
+     }
+ 
++    p = ngx_slprintf(buffer, last, NGX_RTMP_DASH_PERIOD_FOOTER);
++    n = ngx_write_fd(fd, buffer, p - buffer);
++
++    /* UTCTiming value */
++    switch (dacf->clock_compensation) {
++        case NGX_RTMP_DASH_CLOCK_COMPENSATION_NTP:
++                p = ngx_slprintf(buffer, last, NGX_RTMP_DASH_MANIFEST_CLOCK,
++                                 "ntp",
++                                 &dacf->clock_helper_uri
++                );
++                n = ngx_write_fd(fd, buffer, p - buffer);
++        break;
++        case NGX_RTMP_DASH_CLOCK_COMPENSATION_HTTP_HEAD:
++                p = ngx_slprintf(buffer, last, NGX_RTMP_DASH_MANIFEST_CLOCK,
++                                 "http-head",
++                                 &dacf->clock_helper_uri
++                );
++                n = ngx_write_fd(fd, buffer, p - buffer);
++        break;
++        case NGX_RTMP_DASH_CLOCK_COMPENSATION_HTTP_ISO:
++                p = ngx_slprintf(buffer, last, NGX_RTMP_DASH_MANIFEST_CLOCK,
++                                 "http-iso",
++                                 &dacf->clock_helper_uri
++                );
++                n = ngx_write_fd(fd, buffer, p - buffer);
++        break;
++    }
++
+     p = ngx_slprintf(buffer, last, NGX_RTMP_DASH_MANIFEST_FOOTER);
+     n = ngx_write_fd(fd, buffer, p - buffer);
+ 
+@@ -773,6 +908,10 @@ ngx_rtmp_dash_open_fragments(ngx_rtmp_session_t *s)
+         return NGX_OK;
+     }
+ 
++    if (ngx_rtmp_dash_ensure_directory(s) != NGX_OK) {
++        return NGX_ERROR;
++    }
++
+     ngx_rtmp_dash_open_fragment(s, &ctx->video, ctx->id, 'v');
+ 
+     ngx_rtmp_dash_open_fragment(s, &ctx->audio, ctx->id, 'a');
+@@ -1482,16 +1621,24 @@ ngx_rtmp_dash_cleanup_dir(ngx_str_t *ppath, ngx_msec_t playlen)
+     }
+ }
+ 
+-
++#if (nginx_version >= 1011005)
++static ngx_msec_t
++#else
+ static time_t
++#endif
+ ngx_rtmp_dash_cleanup(void *data)
+ {
+     ngx_rtmp_dash_cleanup_t *cleanup = data;
+ 
+     ngx_rtmp_dash_cleanup_dir(&cleanup->path, cleanup->playlen);
+ 
+-    // Next callback in half of playlist length time
+-    return cleanup->playlen / 2000;
++    // Next callback in doubled playlist length time to make sure what all 
++    // players read all segments
++#if (nginx_version >= 1011005)
++    return cleanup->playlen * 2;
++#else
++    return cleanup->playlen / 500;
++#endif
+ }
+ 
+ static ngx_int_t
+@@ -1515,6 +1662,7 @@ ngx_rtmp_dash_create_app_conf(ngx_conf_t *cf)
+     conf->playlen = NGX_CONF_UNSET_MSEC;
+     conf->cleanup = NGX_CONF_UNSET;
+     conf->nested = NGX_CONF_UNSET;
++    conf->clock_compensation = NGX_CONF_UNSET;
+ 
+     return conf;
+ }
+@@ -1532,6 +1680,9 @@ ngx_rtmp_dash_merge_app_conf(ngx_conf_t *cf, void *parent, void *child)
+     ngx_conf_merge_msec_value(conf->playlen, prev->playlen, 30000);
+     ngx_conf_merge_value(conf->cleanup, prev->cleanup, 1);
+     ngx_conf_merge_value(conf->nested, prev->nested, 0);
++    ngx_conf_merge_uint_value(conf->clock_compensation, prev->clock_compensation,
++                              NGX_RTMP_DASH_CLOCK_COMPENSATION_OFF);
++    ngx_conf_merge_str_value(conf->clock_helper_uri, prev->clock_helper_uri, "");
+ 
+     if (conf->fraglen) {
+         conf->winfrags = conf->playlen / conf->fraglen;
+diff --git a/doc/README.md b/doc/README.md
+index 4d73dbb9..f6291956 100644
+--- a/doc/README.md
++++ b/doc/README.md
+@@ -22,3 +22,8 @@
+   * Notify
+     * [on_playlist](directives.md#on_playlist)
+     * [notify_send_redirect](directives.md#notify_send_redirect)
++  * Client Caching
++  	* [hls_allow_client_cache](directives.md#hls_allow_client_cache)
++  * Dash MPD generation
++    * [dash_clock_compensation](directives.md#dash_clock_compensation)
++    * [dash_clock_helper_uri](directives.md#dash_clock_helper_uri)
+diff --git a/doc/directives.md b/doc/directives.md
+index 5f46c393..9ad1f25d 100644
+--- a/doc/directives.md
++++ b/doc/directives.md
+@@ -35,6 +35,7 @@ Table of Contents
+     * [exec_play](#exec_play)
+     * [exec_play_done](#exec_play_done)
+     * [exec_publish_done](#exec_publish_done)
++    * [exec_record_started](#exec_record_started)
+     * [exec_record_done](#exec_record_done)
+ * [Live](#live)
+     * [live](#live)
+@@ -76,6 +77,7 @@ Table of Contents
+     * [on_done](#on_done)
+     * [on_play_done](#on_play_done)
+     * [on_publish_done](#on_publish_done)
++    * [on_record_started](#on_record_started)
+     * [on_record_done](#on_record_done)
+     * [on_update](#on_update)
+     * [notify_update_timeout](#notify_update_timeout)
+@@ -98,6 +100,7 @@ Table of Contents
+     * [hls_fragment_slicing](#hls_fragment_slicing)
+     * [hls_variant](#hls_variant)
+     * [hls_type](#hls_type)
++    * [hls_allow_client_cache](#hls_allow_client_cache)
+     * [hls_keys](#hls_keys)
+     * [hls_key_path](#hls_key_path)
+     * [hls_key_url](#hls_key_url)
+@@ -109,6 +112,8 @@ Table of Contents
+     * [dash_playlist_length](#dash_playlist_length)
+     * [dash_nested](#dash_nested)
+     * [dash_cleanup](#dash_cleanup)
++    * [dash_clock_compensation](#dash_clock_compensation)
++    * [dash_clock_helper_uri](#dash_clock_helper_uri)
+ * [Access log](#access-log)
+     * [access_log](#access_log)
+     * [log_format](#log_format)
+@@ -476,6 +481,18 @@ Specifies external command with arguments to be executed on
+ publish_done event. Return code is not analyzed. Substitution list
+ is the same as for `exec_publish`.
+ 
++#### exec_record_started
++Syntax: `exec_record_started command arg*`  
++Context: rtmp, server, application, recorder
++
++Specifies external command with arguments to be executed when
++recording is started.
++* `recorder` - recorder name
++* `path` - recorded file path (`/tmp/rec/mystream-1389499351.flv`)
++* `filename` - path with directory omitted (`mystream-1389499351.flv`)
++* `basename` - file name with extension omitted (`mystream-1389499351`)
++* `dirname` - directory path (`/tmp/rec`)
++
+ #### exec_record_done
+ Syntax: `exec_record_done command arg*`  
+ Context: rtmp, server, application, recorder
+@@ -1103,6 +1120,16 @@ Context: rtmp, server, application
+ 
+ Same behavior as `on_done` but only for publish end event.
+ 
++#### on_record_started
++syntax: `on_record_started url`  
++context: rtmp, server, application, recorder  
++  
++Set record_started callback. In addition to common HTTP callback
++variables it receives the following values
++* recorder - recorder name in config or empty string for inline recorder
++* path - recording file path
++
++
+ #### on_record_done
+ syntax: `on_record_done url`  
+ context: rtmp, server, application, recorder  
+@@ -1415,6 +1442,19 @@ is enough for the whole event. Default is `live`;
+ hls_type event;
+ ```
+ 
++#### hls_allow_client_cache
++Syntax: `hls_allow_client_cache enabled|disabled`  
++Context: rtmp, server, application  
++
++Enables (or disables) client cache with `#EXT-X-ALLOW-CACHE` playlist
++directive.  Setting value to enabled allows supported clients to
++cache segments in a live DVR manner.  Setting value to disabled explicitly 
++tells supported clients to never cache segments.
++Unset by default (playlist directive will be absent).
++```sh
++hls_allow_client_cache enabled;
++```
++
+ #### hls_keys
+ Syntax: `hls_keys on|off`  
+ Context: rtmp, server, application  
+@@ -1591,6 +1631,45 @@ Init fragments are deleted after stream manifest is deleted.
+ dash_cleanup off;
+ ```
+ 
++#### dash\_clock_compensation
++Syntax: `dash_clock_compensation off|ntp|http_head|http_iso`  
++Context: rtmp, server, application  
++Default: off
++
++Toggles MPEG-DASH clock compentation element output into MPD.
++In this mode nginx provides `UTCTiming` element for MPEG-DASH manifest.
++Clock compensation provided by DASH-client if possible.
++- ntp - use NTP protocol
++- http_head - client must fetch header `Date` from URI (`dash_clock_helper_uri`)
++- http_iso - client must fetch date in ISO format from URI (`dash_clock_helper_uri`)
++
++Standard section: 4.7.2. Service Provider Requirements and Guidelines
++
++```sh
++dash\_clock_compensation off;
++```
++
++#### dash\_clock_helper_uri
++Syntax: `dash_clock_helper_uri URI`  
++Context: rtmp, server, application  
++Default: none
++
++URI helper resource for clock compensation for client.
++Clock compensation type:
++- ntp - address of NTP-server
++- http\_head - full HTTP uri
++- http\_iso - full HTTP uri
++
++Standard section: 4.7.2. Service Provider Requirements and Guidelines
++
++```sh
++dash\_clock\_helper_uri http://rtmp-server/static/time.txt;
++
++_or_
++
++dash\_clock\_helper_uri http://rtmp-server/lua/time-iso;
++```
++
+ ## Access log
+ 
+ #### access_log
+diff --git a/hls/ngx_rtmp_hls_module.c b/hls/ngx_rtmp_hls_module.c
+index 4299ac83..d41daaa3 100644
+--- a/hls/ngx_rtmp_hls_module.c
++++ b/hls/ngx_rtmp_hls_module.c
+@@ -110,6 +110,7 @@ typedef struct {
+     ngx_msec_t                          max_audio_delay;
+     size_t                              audio_buffer_size;
+     ngx_flag_t                          cleanup;
++    ngx_uint_t                          allow_client_cache;
+     ngx_array_t                        *variant;
+     ngx_str_t                           base_url;
+     ngx_int_t                           granularity;
+@@ -137,6 +138,9 @@ typedef struct {
+ #define NGX_RTMP_HLS_TYPE_LIVE          1
+ #define NGX_RTMP_HLS_TYPE_EVENT         2
+ 
++#define NGX_RTMP_HLS_CACHE_DISABLED     1
++#define NGX_RTMP_HLS_CACHE_ENABLED      2
++
+ 
+ static ngx_conf_enum_t                  ngx_rtmp_hls_naming_slots[] = {
+     { ngx_string("sequential"),         NGX_RTMP_HLS_NAMING_SEQUENTIAL },
+@@ -167,6 +171,11 @@ static ngx_conf_enum_t                  ngx_rtmp_hls_type_slots[] = {
+     { ngx_null_string,                  0 }
+ };
+ 
++static ngx_conf_enum_t                  ngx_rtmp_hls_cache[] = {
++    { ngx_string("enabled"),            NGX_RTMP_HLS_CACHE_ENABLED  },
++    { ngx_string("disabled"),           NGX_RTMP_HLS_CACHE_DISABLED },
++    { ngx_null_string,                  0 }
++};
+ 
+ static ngx_command_t ngx_rtmp_hls_commands[] = {
+ 
+@@ -282,6 +291,13 @@ static ngx_command_t ngx_rtmp_hls_commands[] = {
+       offsetof(ngx_rtmp_hls_app_conf_t, cleanup),
+       NULL },
+ 
++    { ngx_string("hls_allow_client_cache"),
++      NGX_RTMP_MAIN_CONF|NGX_RTMP_SRV_CONF|NGX_RTMP_APP_CONF|NGX_CONF_TAKE1,
++      ngx_conf_set_enum_slot,
++      NGX_RTMP_APP_CONF_OFFSET,
++      offsetof(ngx_rtmp_hls_app_conf_t, allow_client_cache),
++      &ngx_rtmp_hls_cache },       
++
+     { ngx_string("hls_variant"),
+       NGX_RTMP_MAIN_CONF|NGX_RTMP_SRV_CONF|NGX_RTMP_APP_CONF|NGX_CONF_1MORE,
+       ngx_rtmp_hls_variant,
+@@ -457,7 +473,7 @@ ngx_rtmp_hls_write_variant_playlist(ngx_rtmp_session_t *s)
+         p = buffer;
+         last = buffer + sizeof(buffer);
+ 
+-        p = ngx_slprintf(p, last, "#EXT-X-STREAM-INF:PROGRAM-ID=1");
++        p = ngx_slprintf(p, last, "#EXT-X-STREAM-INF:PROGRAM-ID=1,CLOSED-CAPTIONS=NONE");
+ 
+         arg = var->args.elts;
+         for (k = 0; k < var->args.nelts; k++, arg++) {
+@@ -564,6 +580,12 @@ ngx_rtmp_hls_write_playlist(ngx_rtmp_session_t *s)
+         p = ngx_slprintf(p, end, "#EXT-X-PLAYLIST-TYPE:EVENT\n");
+     }
+ 
++    if (hacf->allow_client_cache == NGX_RTMP_HLS_CACHE_ENABLED) {
++        p = ngx_slprintf(p, end, "#EXT-X-ALLOW-CACHE:YES\n");
++    } else if (hacf->allow_client_cache == NGX_RTMP_HLS_CACHE_DISABLED) {
++        p = ngx_slprintf(p, end, "#EXT-X-ALLOW-CACHE:NO\n");
++    }
++
+     n = ngx_write_fd(fd, buffer, p - buffer);
+     if (n < 0) {
+         goto write_err;
+@@ -1028,7 +1050,7 @@ ngx_rtmp_hls_open_fragment(ngx_rtmp_session_t *s, uint64_t ts,
+     }
+ 
+     // This is continuity counter for TS header
+-    mpegts_cc = (ctx->nfrags + ctx->frag);
++    mpegts_cc = (ngx_uint_t)(ctx->nfrags + ctx->frag);
+ 
+     ngx_log_debug7(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
+                    "hls: open fragment file='%s', keyfile='%s', "
+@@ -1049,7 +1071,7 @@ ngx_rtmp_hls_open_fragment(ngx_rtmp_session_t *s, uint64_t ts,
+     codec_ctx = ngx_rtmp_get_module_ctx(s, ngx_rtmp_codec_module);
+ 
+     if (ngx_rtmp_mpegts_open_file(&ctx->file, ctx->stream.data,
+-                                  s->connection->log, &codec_ctx->audio_codec_id, mpegts_cc)
++                                  s->connection->log, codec_ctx, mpegts_cc)
+         != NGX_OK)
+     {
+         return NGX_ERROR;
+@@ -2343,8 +2365,11 @@ ngx_rtmp_hls_cleanup_dir(ngx_str_t *ppath, ngx_msec_t playlen)
+     }
+ }
+ 
+-
++#if (nginx_version >= 1011005)
++static ngx_msec_t
++#else
+ static time_t
++#endif
+ ngx_rtmp_hls_cleanup(void *data)
+ {
+     ngx_rtmp_hls_cleanup_t *cleanup = data;
+@@ -2352,7 +2377,11 @@ ngx_rtmp_hls_cleanup(void *data)
+     ngx_rtmp_hls_cleanup_dir(&cleanup->path, cleanup->playlen);
+ 
+     // Next callback in half of playlist length time
++#if (nginx_version >= 1011005)
++    return cleanup->playlen / 2;
++#else
+     return cleanup->playlen / 2000;
++#endif
+ }
+ 
+ 
+@@ -2440,6 +2469,7 @@ ngx_rtmp_hls_create_app_conf(ngx_conf_t *cf)
+     conf->max_audio_delay = NGX_CONF_UNSET_MSEC;
+     conf->audio_buffer_size = NGX_CONF_UNSET_SIZE;
+     conf->cleanup = NGX_CONF_UNSET;
++    conf->allow_client_cache = NGX_CONF_UNSET_UINT;
+     conf->granularity = NGX_CONF_UNSET;
+     conf->keys = NGX_CONF_UNSET;
+     conf->frags_per_key = NGX_CONF_UNSET_UINT;
+diff --git a/hls/ngx_rtmp_mpegts.c b/hls/ngx_rtmp_mpegts.c
+index 71bb766c..b2590b9d 100644
+--- a/hls/ngx_rtmp_mpegts.c
++++ b/hls/ngx_rtmp_mpegts.c
+@@ -7,24 +7,30 @@
+ #include <ngx_config.h>
+ #include <ngx_core.h>
+ #include "ngx_rtmp_mpegts.h"
++#include "ngx_rtmp_mpegts_crc.h"
+ 
+ #include "ngx_rtmp_codec_module.h"
+ 
+ static u_char ngx_rtmp_mpegts_header[] = {
+ 
+-        /* https://en.wikipedia.org/wiki/MPEG_transport_stream#Packet */
++    /* https://en.wikipedia.org/wiki/MPEG_transport_stream#Packet */
+ 
+-    /* TS */
++    /* TS Header */
+     0x47,                                               // Sync byte
+     0x40, 0x00,                                         // TEI(1) + PUS(1) + TP(1) + PID(13)
+-    0x10,                                               // SC(2) + AFF(1) + PF(1) + CC(4)
+-    0x00,
+-    /* PSI */
+-    0x00, 0xb0, 0x0d, 0x00, 0x01, 0xc1, 0x00, 0x00,
++    0x10,                                               // TSC(2) + AFF(1) + PF(1) + CC(4)
++    0x00,                                               // adaption_field_length(8)
++    
+     /* PAT */
+-    0x00, 0x01, 0xef, 0xff,
+-    /* CRC */
+-    0x36, 0x90, 0xe2, 0x3d,
++    0x00,                                               // table_id(8)
++    0xb0, 0x0d,                                         // 1011b(4) + section_length(12)
++    0x00, 0x01,                                         // transport_stream_id(16)
++    0xc1, 0x00, 0x00,                                   // 11b(2) + VN(5) + CNI(1), section_no(8), last_section_no(8)
++    /* PAT program loop */
++    0x00, 0x01, 0xef, 0xff,                             // program_number(16), reserved(3) + program_map_pid(13)
++    /* PAT crc (CRC-32-MPEG2) */
++    0x36, 0x90, 0xe2, 0x3d,                             // !!! Needs to be recalculated each time any bit in PAT is modified (which we dont do at the moment) !!!
++
+     /* stuffing 167 bytes */
+     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+@@ -44,19 +50,26 @@ static u_char ngx_rtmp_mpegts_header[] = {
+     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+ 
+-    /* TS */
+-    0x47,
+-    0x4f, 0xff,
+-    0x10,
+-    0x00,
+-    /* PSI */
+-    0x02, 0xb0, 0x17, 0x00, 0x01, 0xc1, 0x00, 0x00,
++    /* TS Header */
++    0x47,                                               // Sync byte
++    0x4f, 0xff,                                         // TEI(1) + PUS(1) + TP(1) + PID(13)
++    0x10,                                               // TSC(2) + AFF(1) + PF(1) + CC(4)
++    0x00,                                               // adaption_field_length(8)
++    
+     /* PMT */
+-    0xe1, 0x00,
+-    0xf0, 0x00,
+-    0x1b, 0xe1, 0x00, 0xf0, 0x00, /* h264 */
+-    0x00, 0x00, 0x00, 0x00, 0x00, /* audio placeholder */
+-    0x00, 0x00, 0x00, 0x00, /* audio crc placeholder */
++    0x02,                                               // table_id(8)
++    0xb0, 0x12,                                         // 1011b(4) + section_length(12) (section length set below. Ignore this value in here)
++    0x00, 0x01,                                         // program_number(16)
++    0xc1, 0x00, 0x00,                                   // 11b(2) + VN(5) + CNI(1), section_no(8), last_section_no(8)
++    0xe1, 0x00,                                         // reserved(3) + PCR_PID(13)
++    0xf0, 0x00,                                         // reserved(4) + program_info_length(12)
++    
++    /* PMT component loop, looped through when writing header */
++    /* Max size of 14 bytes */
++    /* Also includes the PMT CRC, calculated dynamically */
++    0xff, 0xff, 0xff, 0xff, 0xff,
++    0xff, 0xff, 0xff, 0xff, 0xff,
++    0xff, 0xff, 0xff, 0xff,
+ 
+     /* stuffing 157 bytes */
+     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+@@ -77,18 +90,33 @@ static u_char ngx_rtmp_mpegts_header[] = {
+     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff
+ };
+ 
++static u_char ngx_rtmp_mpegts_header_h264[] = {
++	//H.264 Video, PID 0x100
++    0x1b,                                               // stream_type(8)
++    0xe1, 0x00,                                         // reserved(3) + elementary_PID(13)
++    0xf0, 0x00                                         // reserved(4) + ES_info_length(12)
++};
++
+ static u_char ngx_rtmp_mpegts_header_mp3[] = {
+-    0x03, 0xe1, 0x01, 0xf0, 0x00, /* mp3 */
+-    /* CRC */
+-    0x4e, 0x59, 0x3d, 0x1e, /* crc for mp3 */
++	//MP3 Audio, PID 0x101
++    0x03,                                               // stream_type(8)
++    0xe1, 0x01,                                         // reserved(3) + elementary_PID(13)
++    0xf0, 0x00                                          // reserved(4) + ES_info_length(12)
+ };
+ 
+ static u_char ngx_rtmp_mpegts_header_aac[] = {
+-    0x0f, 0xe1, 0x01, 0xf0, 0x00, /* aac */
+-    /* CRC */
+-    0x2f, 0x44, 0xb9, 0x9b, /* crc for aac */
++    //ADTS AAC Audio, PID 0x101
++    0x0f,                                               // stream_type(8)
++    0xe1, 0x01,                                         // reserved(3) + elementary_PID(13)
++    0xf0, 0x00                                          // reserved(4) + ES_info_length(12)
+ };
+ 
++#define NGX_RTMP_MPEGTS_PMT_CRC_START_OFFSET 193
++#define NGX_RTMP_MPEGTS_PMT_CRC_MIN_LENGTH 12
++#define NGX_RTMP_MPEGTS_PMT_SECTION_LENGTH_OFFSET 195
++#define NGX_RTMP_MPEGTS_PMT_LOOP_OFFSET 205
++#define NGX_RTMP_MPEGTS_PID_SIZE 5
++
+ /* 700 ms PCR delay */
+ #define NGX_RTMP_HLS_DELAY  63000
+ 
+@@ -173,27 +201,53 @@ ngx_rtmp_mpegts_write_file(ngx_rtmp_mpegts_file_t *file, u_char *in,
+ 
+ 
+ static ngx_int_t
+-ngx_rtmp_mpegts_write_header(ngx_rtmp_mpegts_file_t *file, ngx_uint_t *audio_codec_id, ngx_uint_t mpegts_cc)
++ngx_rtmp_mpegts_write_header(ngx_rtmp_mpegts_file_t *file, ngx_rtmp_codec_ctx_t *codec_ctx, ngx_uint_t mpegts_cc)
+ {
++    ngx_int_t next_pid_offset = 0; //Used to track the number of PIDs we have and the offset in 5-byte chunks
+ 
+-    if (*audio_codec_id == NGX_RTMP_AUDIO_AAC) {
+-        ngx_memcpy(ngx_rtmp_mpegts_header+210, ngx_rtmp_mpegts_header_aac, 
+-                                        sizeof(ngx_rtmp_mpegts_header_aac));
+-    }
+-    //if (*audio_codec_id == NGX_RTMP_AUDIO_MP3) {
+-    else {
+-        ngx_memcpy(ngx_rtmp_mpegts_header+210, ngx_rtmp_mpegts_header_mp3, 
+-                                        sizeof(ngx_rtmp_mpegts_header_mp3));
+-    }
+-
+-    // Truncate counter to 4 bits here
++    //MPEG-TS CC is 4 bits long. Need to truncate it here.
+     mpegts_cc %= 0x0f;
+-    // And fill headers
++    // And then put it in the headers
+     ngx_rtmp_mpegts_header[3] = (ngx_rtmp_mpegts_header[3] & 0xf0) + (u_char)mpegts_cc;
+     ngx_rtmp_mpegts_header[191] = (ngx_rtmp_mpegts_header[191] & 0xf0) + (u_char)mpegts_cc;
+ 
+-    return ngx_rtmp_mpegts_write_file(file, ngx_rtmp_mpegts_header,
+-                                      sizeof(ngx_rtmp_mpegts_header));
++    //ngx_rtmp_mpegts_header 
++
++    if (codec_ctx->video_codec_id)
++    {
++        //Put h264 PID in the PMT
++        ngx_memcpy(ngx_rtmp_mpegts_header+NGX_RTMP_MPEGTS_PMT_LOOP_OFFSET+next_pid_offset, ngx_rtmp_mpegts_header_h264, NGX_RTMP_MPEGTS_PID_SIZE);
++
++        next_pid_offset += NGX_RTMP_MPEGTS_PID_SIZE;
++    }
++
++    if (codec_ctx->audio_codec_id){
++    	//Put Audio PID in the PMT
++        if (codec_ctx->audio_codec_id == NGX_RTMP_AUDIO_AAC) {
++            ngx_memcpy(ngx_rtmp_mpegts_header+NGX_RTMP_MPEGTS_PMT_LOOP_OFFSET+next_pid_offset, ngx_rtmp_mpegts_header_aac, NGX_RTMP_MPEGTS_PID_SIZE);
++        }
++        else 
++        {
++            ngx_memcpy(ngx_rtmp_mpegts_header+NGX_RTMP_MPEGTS_PMT_LOOP_OFFSET+next_pid_offset, ngx_rtmp_mpegts_header_mp3, NGX_RTMP_MPEGTS_PID_SIZE);
++        }
++    	next_pid_offset += NGX_RTMP_MPEGTS_PID_SIZE;
++    }
++
++    //Set section length of PMT
++    //PMT is 13 bytes long without any programs in it. Add this in
++    ngx_rtmp_mpegts_header[NGX_RTMP_MPEGTS_PMT_SECTION_LENGTH_OFFSET] = 13 + next_pid_offset;
++
++    //Calculate CRC
++    ngx_rtmp_mpegts_crc_t crc = ngx_rtmp_mpegts_crc_init();
++    crc = ngx_rtmp_mpegts_crc_update(crc, ngx_rtmp_mpegts_header+NGX_RTMP_MPEGTS_PMT_CRC_START_OFFSET, NGX_RTMP_MPEGTS_PMT_CRC_MIN_LENGTH+next_pid_offset);
++    crc = ngx_rtmp_mpegts_crc_finalize(crc);
++
++    ngx_rtmp_mpegts_header[NGX_RTMP_MPEGTS_PMT_LOOP_OFFSET+next_pid_offset] = (crc >> 24) & 0xff;
++    ngx_rtmp_mpegts_header[NGX_RTMP_MPEGTS_PMT_LOOP_OFFSET+next_pid_offset+1] = (crc >> 16) & 0xff;
++    ngx_rtmp_mpegts_header[NGX_RTMP_MPEGTS_PMT_LOOP_OFFSET+next_pid_offset+2] = (crc >> 8) & 0xff;
++    ngx_rtmp_mpegts_header[NGX_RTMP_MPEGTS_PMT_LOOP_OFFSET+next_pid_offset+3] = crc & 0xff;
++
++    return ngx_rtmp_mpegts_write_file(file, ngx_rtmp_mpegts_header, sizeof(ngx_rtmp_mpegts_header));
+ }
+ 
+ 
+@@ -383,7 +437,7 @@ ngx_rtmp_mpegts_init_encryption(ngx_rtmp_mpegts_file_t *file,
+ 
+ ngx_int_t
+ ngx_rtmp_mpegts_open_file(ngx_rtmp_mpegts_file_t *file, u_char *path,
+-    ngx_log_t *log, ngx_uint_t *audio_codec_id, ngx_uint_t mpegts_cc)
++    ngx_log_t *log, ngx_rtmp_codec_ctx_t *codec_ctx, ngx_uint_t mpegts_cc)
+ {
+     file->log = log;
+ 
+@@ -398,7 +452,7 @@ ngx_rtmp_mpegts_open_file(ngx_rtmp_mpegts_file_t *file, u_char *path,
+ 
+     file->size = 0;
+ 
+-    if (ngx_rtmp_mpegts_write_header(file, audio_codec_id, mpegts_cc) != NGX_OK) {
++    if (ngx_rtmp_mpegts_write_header(file, codec_ctx, mpegts_cc) != NGX_OK) {
+         ngx_log_error(NGX_LOG_ERR, log, ngx_errno,
+                       "hls: error writing fragment header");
+         ngx_close_file(file->fd);
+diff --git a/hls/ngx_rtmp_mpegts.h b/hls/ngx_rtmp_mpegts.h
+index 8c8cb1b1..355b5a5d 100644
+--- a/hls/ngx_rtmp_mpegts.h
++++ b/hls/ngx_rtmp_mpegts.h
+@@ -12,6 +12,8 @@
+ #include <ngx_core.h>
+ #include <openssl/aes.h>
+ 
++#include <ngx_rtmp_codec_module.h>
++
+ 
+ typedef struct {
+     ngx_fd_t    fd;
+@@ -37,7 +39,7 @@ typedef struct {
+ ngx_int_t ngx_rtmp_mpegts_init_encryption(ngx_rtmp_mpegts_file_t *file,
+     u_char *key, size_t key_len, uint64_t iv);
+ ngx_int_t ngx_rtmp_mpegts_open_file(ngx_rtmp_mpegts_file_t *file, u_char *path,
+-    ngx_log_t *log, ngx_uint_t *audio_codec_id, ngx_uint_t mpegts_cc);
++    ngx_log_t *log, ngx_rtmp_codec_ctx_t *codec_ctx, ngx_uint_t mpegts_cc);
+ ngx_int_t ngx_rtmp_mpegts_close_file(ngx_rtmp_mpegts_file_t *file);
+ ngx_int_t ngx_rtmp_mpegts_write_frame(ngx_rtmp_mpegts_file_t *file,
+     ngx_rtmp_mpegts_frame_t *f, ngx_buf_t *b);
+diff --git a/hls/ngx_rtmp_mpegts_crc.c b/hls/ngx_rtmp_mpegts_crc.c
+new file mode 100644
+index 00000000..437d605d
+--- /dev/null
++++ b/hls/ngx_rtmp_mpegts_crc.c
+@@ -0,0 +1,80 @@
++/**
++ * \file crc.c
++ * Functions and types for CRC checks.
++ *
++ * Generated on Thu May  5 15:32:31 2016,
++ * by pycrc v0.9, https://pycrc.org
++ * using the configuration:
++ *    Width         = 32
++ *    Poly          = 0x04c11db7
++ *    Xor_In        = 0xffffffff
++ *    ReflectIn     = False
++ *    Xor_Out       = 0x00000000
++ *    ReflectOut    = False
++ *    Algorithm     = table-driven
++ *****************************************************************************/
++#include "ngx_rtmp_mpegts_crc.h"     /* include the header file generated with pycrc */
++#include <stdlib.h>
++#include <stdint.h>
++
++/**
++ * Static table used for the table_driven implementation.
++ *****************************************************************************/
++static const ngx_rtmp_mpegts_crc_t ngx_rtmp_mpegts_crc_table[256] = {
++    0x00000000, 0x04c11db7, 0x09823b6e, 0x0d4326d9, 0x130476dc, 0x17c56b6b, 0x1a864db2, 0x1e475005,
++    0x2608edb8, 0x22c9f00f, 0x2f8ad6d6, 0x2b4bcb61, 0x350c9b64, 0x31cd86d3, 0x3c8ea00a, 0x384fbdbd,
++    0x4c11db70, 0x48d0c6c7, 0x4593e01e, 0x4152fda9, 0x5f15adac, 0x5bd4b01b, 0x569796c2, 0x52568b75,
++    0x6a1936c8, 0x6ed82b7f, 0x639b0da6, 0x675a1011, 0x791d4014, 0x7ddc5da3, 0x709f7b7a, 0x745e66cd,
++    0x9823b6e0, 0x9ce2ab57, 0x91a18d8e, 0x95609039, 0x8b27c03c, 0x8fe6dd8b, 0x82a5fb52, 0x8664e6e5,
++    0xbe2b5b58, 0xbaea46ef, 0xb7a96036, 0xb3687d81, 0xad2f2d84, 0xa9ee3033, 0xa4ad16ea, 0xa06c0b5d,
++    0xd4326d90, 0xd0f37027, 0xddb056fe, 0xd9714b49, 0xc7361b4c, 0xc3f706fb, 0xceb42022, 0xca753d95,
++    0xf23a8028, 0xf6fb9d9f, 0xfbb8bb46, 0xff79a6f1, 0xe13ef6f4, 0xe5ffeb43, 0xe8bccd9a, 0xec7dd02d,
++    0x34867077, 0x30476dc0, 0x3d044b19, 0x39c556ae, 0x278206ab, 0x23431b1c, 0x2e003dc5, 0x2ac12072,
++    0x128e9dcf, 0x164f8078, 0x1b0ca6a1, 0x1fcdbb16, 0x018aeb13, 0x054bf6a4, 0x0808d07d, 0x0cc9cdca,
++    0x7897ab07, 0x7c56b6b0, 0x71159069, 0x75d48dde, 0x6b93dddb, 0x6f52c06c, 0x6211e6b5, 0x66d0fb02,
++    0x5e9f46bf, 0x5a5e5b08, 0x571d7dd1, 0x53dc6066, 0x4d9b3063, 0x495a2dd4, 0x44190b0d, 0x40d816ba,
++    0xaca5c697, 0xa864db20, 0xa527fdf9, 0xa1e6e04e, 0xbfa1b04b, 0xbb60adfc, 0xb6238b25, 0xb2e29692,
++    0x8aad2b2f, 0x8e6c3698, 0x832f1041, 0x87ee0df6, 0x99a95df3, 0x9d684044, 0x902b669d, 0x94ea7b2a,
++    0xe0b41de7, 0xe4750050, 0xe9362689, 0xedf73b3e, 0xf3b06b3b, 0xf771768c, 0xfa325055, 0xfef34de2,
++    0xc6bcf05f, 0xc27dede8, 0xcf3ecb31, 0xcbffd686, 0xd5b88683, 0xd1799b34, 0xdc3abded, 0xd8fba05a,
++    0x690ce0ee, 0x6dcdfd59, 0x608edb80, 0x644fc637, 0x7a089632, 0x7ec98b85, 0x738aad5c, 0x774bb0eb,
++    0x4f040d56, 0x4bc510e1, 0x46863638, 0x42472b8f, 0x5c007b8a, 0x58c1663d, 0x558240e4, 0x51435d53,
++    0x251d3b9e, 0x21dc2629, 0x2c9f00f0, 0x285e1d47, 0x36194d42, 0x32d850f5, 0x3f9b762c, 0x3b5a6b9b,
++    0x0315d626, 0x07d4cb91, 0x0a97ed48, 0x0e56f0ff, 0x1011a0fa, 0x14d0bd4d, 0x19939b94, 0x1d528623,
++    0xf12f560e, 0xf5ee4bb9, 0xf8ad6d60, 0xfc6c70d7, 0xe22b20d2, 0xe6ea3d65, 0xeba91bbc, 0xef68060b,
++    0xd727bbb6, 0xd3e6a601, 0xdea580d8, 0xda649d6f, 0xc423cd6a, 0xc0e2d0dd, 0xcda1f604, 0xc960ebb3,
++    0xbd3e8d7e, 0xb9ff90c9, 0xb4bcb610, 0xb07daba7, 0xae3afba2, 0xaafbe615, 0xa7b8c0cc, 0xa379dd7b,
++    0x9b3660c6, 0x9ff77d71, 0x92b45ba8, 0x9675461f, 0x8832161a, 0x8cf30bad, 0x81b02d74, 0x857130c3,
++    0x5d8a9099, 0x594b8d2e, 0x5408abf7, 0x50c9b640, 0x4e8ee645, 0x4a4ffbf2, 0x470cdd2b, 0x43cdc09c,
++    0x7b827d21, 0x7f436096, 0x7200464f, 0x76c15bf8, 0x68860bfd, 0x6c47164a, 0x61043093, 0x65c52d24,
++    0x119b4be9, 0x155a565e, 0x18197087, 0x1cd86d30, 0x029f3d35, 0x065e2082, 0x0b1d065b, 0x0fdc1bec,
++    0x3793a651, 0x3352bbe6, 0x3e119d3f, 0x3ad08088, 0x2497d08d, 0x2056cd3a, 0x2d15ebe3, 0x29d4f654,
++    0xc5a92679, 0xc1683bce, 0xcc2b1d17, 0xc8ea00a0, 0xd6ad50a5, 0xd26c4d12, 0xdf2f6bcb, 0xdbee767c,
++    0xe3a1cbc1, 0xe760d676, 0xea23f0af, 0xeee2ed18, 0xf0a5bd1d, 0xf464a0aa, 0xf9278673, 0xfde69bc4,
++    0x89b8fd09, 0x8d79e0be, 0x803ac667, 0x84fbdbd0, 0x9abc8bd5, 0x9e7d9662, 0x933eb0bb, 0x97ffad0c,
++    0xafb010b1, 0xab710d06, 0xa6322bdf, 0xa2f33668, 0xbcb4666d, 0xb8757bda, 0xb5365d03, 0xb1f740b4
++};
++
++/**
++ * Update the crc value with new data.
++ *
++ * \param crc      The current crc value.
++ * \param data     Pointer to a buffer of \a data_len bytes.
++ * \param data_len Number of bytes in the \a data buffer.
++ * \return         The updated crc value.
++ *****************************************************************************/
++ngx_rtmp_mpegts_crc_t ngx_rtmp_mpegts_crc_update(ngx_rtmp_mpegts_crc_t crc, const void *data, size_t data_len)
++{
++    const unsigned char *d = (const unsigned char *)data;
++    unsigned int tbl_idx;
++
++    while (data_len--) {
++        tbl_idx = ((crc >> 24) ^ *d) & 0xff;
++        crc = (ngx_rtmp_mpegts_crc_table[tbl_idx] ^ (crc << 8)) & 0xffffffff;
++
++        d++;
++    }
++    return crc & 0xffffffff;
++}
++
++
+diff --git a/hls/ngx_rtmp_mpegts_crc.h b/hls/ngx_rtmp_mpegts_crc.h
+new file mode 100644
+index 00000000..b3f41e3e
+--- /dev/null
++++ b/hls/ngx_rtmp_mpegts_crc.h
+@@ -0,0 +1,83 @@
++/**
++ * \file crc.h
++ * Functions and types for CRC checks.
++ *
++ * Generated on Thu May  5 15:32:22 2016,
++ * by pycrc v0.9, https://pycrc.org
++ * using the configuration:
++ *    Width         = 32
++ *    Poly          = 0x04c11db7
++ *    Xor_In        = 0xffffffff
++ *    ReflectIn     = False
++ *    Xor_Out       = 0x00000000
++ *    ReflectOut    = False
++ *    Algorithm     = table-driven
++ *****************************************************************************/
++#ifndef _NGX_RTMP_MPEGTS_CRC_H_INCLUDED_
++#define _NGX_RTMP_MPEGTS_CRC_H_INCLUDED_
++
++
++#include <stdlib.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++
++/**
++ * The definition of the used algorithm.
++ *
++ * This is not used anywhere in the generated code, but it may be used by the
++ * application code to call algoritm-specific code, is desired.
++ *****************************************************************************/
++#define CRC_ALGO_TABLE_DRIVEN 1
++
++
++/**
++ * The type of the CRC values.
++ *
++ * This type must be big enough to contain at least 32 bits.
++ *****************************************************************************/
++typedef uint_fast32_t ngx_rtmp_mpegts_crc_t;
++
++
++/**
++ * Calculate the initial crc value.
++ *
++ * \return     The initial crc value.
++ *****************************************************************************/
++static inline ngx_rtmp_mpegts_crc_t ngx_rtmp_mpegts_crc_init(void)
++{
++    return 0xffffffff;
++}
++
++
++/**
++ * Update the crc value with new data.
++ *
++ * \param crc      The current crc value.
++ * \param data     Pointer to a buffer of \a data_len bytes.
++ * \param data_len Number of bytes in the \a data buffer.
++ * \return         The updated crc value.
++ *****************************************************************************/
++ngx_rtmp_mpegts_crc_t ngx_rtmp_mpegts_crc_update(ngx_rtmp_mpegts_crc_t crc, const void *data, size_t data_len);
++
++
++/**
++ * Calculate the final crc value.
++ *
++ * \param crc  The current crc value.
++ * \return     The final crc value.
++ *****************************************************************************/
++static inline ngx_rtmp_mpegts_crc_t ngx_rtmp_mpegts_crc_finalize(ngx_rtmp_mpegts_crc_t crc)
++{
++    return crc ^ 0x00000000;
++}
++
++
++#ifdef __cplusplus
++}           /* closing brace for extern "C" */
++#endif
++
++#endif      /* _NGX_RTMP_MPEGTS_CRC_H_INCLUDED_ */
+diff --git a/ngx_rtmp.c b/ngx_rtmp.c
+index 7c4a8611..ad671d47 100644
+--- a/ngx_rtmp.c
++++ b/ngx_rtmp.c
+@@ -87,6 +87,7 @@ ngx_rtmp_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+     ngx_uint_t                   i, m, mi, s;
+     ngx_conf_t                   pcf;
+     ngx_array_t                  ports;
++    ngx_module_t               **modules;
+     ngx_rtmp_listen_t           *listen;
+     ngx_rtmp_module_t           *module;
+     ngx_rtmp_conf_ctx_t         *ctx;
+@@ -101,14 +102,18 @@ ngx_rtmp_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+     *(ngx_rtmp_conf_ctx_t **) conf = ctx;
+ 
+     /* count the number of the rtmp modules and set up their indices */
+-
++#if defined(nginx_version) && nginx_version >= 1009011
++    modules = cf->cycle->modules;
++#else
++    modules = ngx_modules;
++#endif
+     ngx_rtmp_max_module = 0;
+-    for (m = 0; ngx_modules[m]; m++) {
+-        if (ngx_modules[m]->type != NGX_RTMP_MODULE) {
++    for (m = 0; modules[m]; m++) {
++        if (modules[m]->type != NGX_RTMP_MODULE) {
+             continue;
+         }
+ 
+-        ngx_modules[m]->ctx_index = ngx_rtmp_max_module++;
++        modules[m]->ctx_index = ngx_rtmp_max_module++;
+     }
+ 
+ 
+@@ -148,13 +153,13 @@ ngx_rtmp_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+      * of the all rtmp modules
+      */
+ 
+-    for (m = 0; ngx_modules[m]; m++) {
+-        if (ngx_modules[m]->type != NGX_RTMP_MODULE) {
++    for (m = 0; modules[m]; m++) {
++        if (modules[m]->type != NGX_RTMP_MODULE) {
+             continue;
+         }
+ 
+-        module = ngx_modules[m]->ctx;
+-        mi = ngx_modules[m]->ctx_index;
++        module = modules[m]->ctx;
++        mi = modules[m]->ctx_index;
+ 
+         if (module->create_main_conf) {
+             ctx->main_conf[mi] = module->create_main_conf(cf);
+@@ -181,12 +186,12 @@ ngx_rtmp_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+     pcf = *cf;
+     cf->ctx = ctx;
+ 
+-    for (m = 0; ngx_modules[m]; m++) {
+-        if (ngx_modules[m]->type != NGX_RTMP_MODULE) {
++    for (m = 0; modules[m]; m++) {
++        if (modules[m]->type != NGX_RTMP_MODULE) {
+             continue;
+         }
+ 
+-        module = ngx_modules[m]->ctx;
++        module = modules[m]->ctx;
+ 
+         if (module->preconfiguration) {
+             if (module->preconfiguration(cf) != NGX_OK) {
+@@ -212,13 +217,13 @@ ngx_rtmp_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+     cmcf = ctx->main_conf[ngx_rtmp_core_module.ctx_index];
+     cscfp = cmcf->servers.elts;
+ 
+-    for (m = 0; ngx_modules[m]; m++) {
+-        if (ngx_modules[m]->type != NGX_RTMP_MODULE) {
++    for (m = 0; modules[m]; m++) {
++        if (modules[m]->type != NGX_RTMP_MODULE) {
+             continue;
+         }
+ 
+-        module = ngx_modules[m]->ctx;
+-        mi = ngx_modules[m]->ctx_index;
++        module = modules[m]->ctx;
++        mi = modules[m]->ctx_index;
+ 
+         /* init rtmp{} main_conf's */
+ 
+@@ -283,12 +288,12 @@ ngx_rtmp_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+         return NGX_CONF_ERROR;
+     }
+ 
+-    for (m = 0; ngx_modules[m]; m++) {
+-        if (ngx_modules[m]->type != NGX_RTMP_MODULE) {
++    for (m = 0; modules[m]; m++) {
++        if (modules[m]->type != NGX_RTMP_MODULE) {
+             continue;
+         }
+ 
+-        module = ngx_modules[m]->ctx;
++        module = modules[m]->ctx;
+ 
+         if (module->postconfiguration) {
+             if (module->postconfiguration(cf) != NGX_OK) {
+diff --git a/ngx_rtmp_auto_push_module.c b/ngx_rtmp_auto_push_module.c
+index 2f3533db..60c85d77 100644
+--- a/ngx_rtmp_auto_push_module.c
++++ b/ngx_rtmp_auto_push_module.c
+@@ -93,6 +93,34 @@ ngx_module_t  ngx_rtmp_auto_push_module = {
+ };
+ 
+ 
++static ngx_rtmp_module_t  ngx_rtmp_auto_push_index_module_ctx = {
++    NULL,                                   /* preconfiguration */
++    NULL,                                   /* postconfiguration */
++    NULL,                                   /* create main configuration */
++    NULL,                                   /* init main configuration */
++    NULL,                                   /* create server configuration */
++    NULL,                                   /* merge server configuration */
++    NULL,                                   /* create app configuration */
++    NULL                                    /* merge app configuration */
++};
++
++
++ngx_module_t  ngx_rtmp_auto_push_index_module = {
++    NGX_MODULE_V1,
++    &ngx_rtmp_auto_push_index_module_ctx,   /* module context */
++    NULL,                                   /* module directives */
++    NGX_RTMP_MODULE,                        /* module type */
++    NULL,                                   /* init master */
++    NULL,                                   /* init module */
++    NULL,                                   /* init process */
++    NULL,                                   /* init thread */
++    NULL,                                   /* exit thread */
++    NULL,                                   /* exit process */
++    NULL,                                   /* exit master */
++    NGX_MODULE_V1_PADDING
++};
++
++
+ #define NGX_RTMP_AUTO_PUSH_SOCKNAME         "nginx-rtmp"
+ 
+ 
+@@ -324,7 +352,7 @@ ngx_rtmp_auto_push_reconnect(ngx_event_t *ev)
+ 
+     apcf = (ngx_rtmp_auto_push_conf_t *) ngx_get_conf(ngx_cycle->conf_ctx,
+                                                     ngx_rtmp_auto_push_module);
+-    ctx = ngx_rtmp_get_module_ctx(s, ngx_rtmp_auto_push_module);
++    ctx = ngx_rtmp_get_module_ctx(s, ngx_rtmp_auto_push_index_module);
+     if (ctx == NULL) {
+         return;
+     }
+@@ -461,14 +489,14 @@ ngx_rtmp_auto_push_publish(ngx_rtmp_session_t *s, ngx_rtmp_publish_t *v)
+         goto next;
+     }
+ 
+-    ctx = ngx_rtmp_get_module_ctx(s, ngx_rtmp_auto_push_module);
++    ctx = ngx_rtmp_get_module_ctx(s, ngx_rtmp_auto_push_index_module);
+     if (ctx == NULL) {
+         ctx = ngx_palloc(s->connection->pool,
+                          sizeof(ngx_rtmp_auto_push_ctx_t));
+         if (ctx == NULL) {
+             goto next;
+         }
+-        ngx_rtmp_set_ctx(s, ctx, ngx_rtmp_auto_push_module);
++        ngx_rtmp_set_ctx(s, ctx, ngx_rtmp_auto_push_index_module);
+ 
+     }
+     ngx_memzero(ctx, sizeof(*ctx));
+@@ -508,7 +536,7 @@ ngx_rtmp_auto_push_delete_stream(ngx_rtmp_session_t *s,
+         goto next;
+     }
+ 
+-    ctx = ngx_rtmp_get_module_ctx(s, ngx_rtmp_auto_push_module);
++    ctx = ngx_rtmp_get_module_ctx(s, ngx_rtmp_auto_push_index_module);
+     if (ctx) {
+         if (ctx->push_evt.timer_set) {
+             ngx_del_timer(&ctx->push_evt);
+@@ -532,7 +560,7 @@ ngx_rtmp_auto_push_delete_stream(ngx_rtmp_session_t *s,
+                    slot, &rctx->app, &rctx->name);
+ 
+     pctx = ngx_rtmp_get_module_ctx(rctx->publish->session,
+-                                   ngx_rtmp_auto_push_module);
++                                   ngx_rtmp_auto_push_index_module);
+     if (pctx == NULL) {
+         goto next;
+     }
+diff --git a/ngx_rtmp_cmd_module.h b/ngx_rtmp_cmd_module.h
+index 9a241121..a419158f 100644
+--- a/ngx_rtmp_cmd_module.h
++++ b/ngx_rtmp_cmd_module.h
+@@ -14,8 +14,8 @@
+ #include "ngx_rtmp.h"
+ 
+ 
+-#define NGX_RTMP_MAX_NAME           256
+-#define NGX_RTMP_MAX_URL            256
++#define NGX_RTMP_MAX_NAME           2048
++#define NGX_RTMP_MAX_URL            4096
+ #define NGX_RTMP_MAX_ARGS           NGX_RTMP_MAX_NAME
+ 
+ 
+diff --git a/ngx_rtmp_codec_module.c b/ngx_rtmp_codec_module.c
+index 2f1eb685..73d31a1a 100644
+--- a/ngx_rtmp_codec_module.c
++++ b/ngx_rtmp_codec_module.c
+@@ -454,7 +454,7 @@ ngx_rtmp_codec_parse_avc_header(ngx_rtmp_session_t *s, ngx_chain_t *in)
+                         if (sl_next != 0) {
+ 
+                             /* convert to signed: (-1)**k+1 * ceil(k/2) */
+-                            sl_udelta = ngx_rtmp_bit_read_golomb(&br);
++                            sl_udelta = (ngx_uint_t)ngx_rtmp_bit_read_golomb(&br);
+                             sl_delta = (sl_udelta + 1) >> 1;
+                             if ((sl_udelta & 1) == 0) {
+                                 sl_delta = -sl_delta;
+@@ -900,7 +900,7 @@ ngx_rtmp_codec_meta_data(ngx_rtmp_session_t *s, ngx_rtmp_header_t *h,
+     if (v.profile[0] != '\0') ngx_memcpy(ctx->profile, v.profile, sizeof(v.profile));
+     if (v.level[0] != '\0') ngx_memcpy(ctx->level, v.level, sizeof(v.level));
+ 
+-    ngx_log_debug8(NGX_LOG_DEBUG, s->connection->log, 0,
++    ngx_log_debug8(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
+             "codec: data frame: "
+             "width=%ui height=%ui duration=%.3f frame_rate=%.3f "
+             "video=%s (%ui) audio=%s (%ui)",
+@@ -910,6 +910,12 @@ ngx_rtmp_codec_meta_data(ngx_rtmp_session_t *s, ngx_rtmp_header_t *h,
+             ngx_rtmp_get_audio_codec_name(ctx->audio_codec_id),
+             ctx->audio_codec_id);
+ 
++    ngx_log_debug2(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
++            "codec: data frame: "
++            "video_rate=%.3f audio_rate=%.3f ",
++            ctx->video_data_rate, ctx->audio_data_rate
++            );
++
+     switch (cacf->meta) {
+         case NGX_RTMP_CODEC_META_ON:
+             return ngx_rtmp_codec_reconstruct_meta(s);
+diff --git a/ngx_rtmp_core_module.c b/ngx_rtmp_core_module.c
+index 01303c65..1037f823 100644
+--- a/ngx_rtmp_core_module.c
++++ b/ngx_rtmp_core_module.c
+@@ -45,7 +45,7 @@ static ngx_command_t  ngx_rtmp_core_commands[] = {
+       NULL },
+ 
+     { ngx_string("listen"),
+-      NGX_RTMP_SRV_CONF|NGX_CONF_TAKE12,
++      NGX_RTMP_SRV_CONF|NGX_CONF_1MORE,
+       ngx_rtmp_core_listen,
+       NGX_RTMP_SRV_CONF_OFFSET,
+       0,
+@@ -332,6 +332,7 @@ ngx_rtmp_core_server(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+     void                       *mconf;
+     ngx_uint_t                  m;
+     ngx_conf_t                  pcf;
++    ngx_module_t              **modules;
+     ngx_rtmp_module_t          *module;
+     ngx_rtmp_conf_ctx_t        *ctx, *rtmp_ctx;
+     ngx_rtmp_core_srv_conf_t   *cscf, **cscfp;
+@@ -357,12 +358,17 @@ ngx_rtmp_core_server(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+         return NGX_CONF_ERROR;
+     }
+ 
+-    for (m = 0; ngx_modules[m]; m++) {
+-        if (ngx_modules[m]->type != NGX_RTMP_MODULE) {
++#if defined(nginx_version) && nginx_version >= 1009011
++    modules = cf->cycle->modules;
++#else
++    modules = ngx_modules;
++#endif
++    for (m = 0; modules[m]; m++) {
++        if (modules[m]->type != NGX_RTMP_MODULE) {
+             continue;
+         }
+ 
+-        module = ngx_modules[m]->ctx;
++        module = modules[m]->ctx;
+ 
+         if (module->create_srv_conf) {
+             mconf = module->create_srv_conf(cf);
+@@ -370,7 +376,7 @@ ngx_rtmp_core_server(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+                 return NGX_CONF_ERROR;
+             }
+ 
+-            ctx->srv_conf[ngx_modules[m]->ctx_index] = mconf;
++            ctx->srv_conf[modules[m]->ctx_index] = mconf;
+         }
+ 
+         if (module->create_app_conf) {
+@@ -379,7 +385,7 @@ ngx_rtmp_core_server(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+                 return NGX_CONF_ERROR;
+             }
+ 
+-            ctx->app_conf[ngx_modules[m]->ctx_index] = mconf;
++            ctx->app_conf[modules[m]->ctx_index] = mconf;
+         }
+     }
+ 
+@@ -419,6 +425,7 @@ ngx_rtmp_core_application(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+     ngx_int_t                   i;
+     ngx_str_t                  *value;
+     ngx_conf_t                  save;
++    ngx_module_t              **modules;
+     ngx_rtmp_module_t          *module;
+     ngx_rtmp_conf_ctx_t        *ctx, *pctx;
+     ngx_rtmp_core_srv_conf_t   *cscf;
+@@ -438,17 +445,21 @@ ngx_rtmp_core_application(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+         return NGX_CONF_ERROR;
+     }
+ 
+-    for (i = 0; ngx_modules[i]; i++) {
+-        if (ngx_modules[i]->type != NGX_RTMP_MODULE) {
++#if defined(nginx_version) && nginx_version >= 1009011
++    modules = cf->cycle->modules;
++#else
++    modules = ngx_modules;
++#endif
++    for (i = 0; modules[i]; i++) {
++        if (modules[i]->type != NGX_RTMP_MODULE) {
+             continue;
+         }
+ 
+-        module = ngx_modules[i]->ctx;
++        module = modules[i]->ctx;
+ 
+         if (module->create_app_conf) {
+-            ctx->app_conf[ngx_modules[i]->ctx_index] =
+-                                module->create_app_conf(cf);
+-            if (ctx->app_conf[ngx_modules[i]->ctx_index] == NULL) {
++            ctx->app_conf[modules[i]->ctx_index] = module->create_app_conf(cf);
++            if (ctx->app_conf[modules[i]->ctx_index] == NULL) {
+                 return NGX_CONF_ERROR;
+             }
+         }
+@@ -488,7 +499,7 @@ ngx_rtmp_core_listen(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+     in_port_t                   port;
+     ngx_str_t                  *value;
+     ngx_url_t                   u;
+-    ngx_uint_t                  i, m;
++    ngx_uint_t                  i;
+     struct sockaddr            *sa;
+     ngx_rtmp_listen_t          *ls;
+     struct sockaddr_in         *sin;
+@@ -545,7 +556,11 @@ ngx_rtmp_core_listen(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+             break;
+         }
+ 
++#if (nginx_version >= 1011000)
++        if (ngx_memcmp(ls[i].sockaddr + off, (u_char *) &u.sockaddr + off, len) != 0) {
++#else
+         if (ngx_memcmp(ls[i].sockaddr + off, u.sockaddr + off, len) != 0) {
++#endif
+             continue;
+         }
+ 
+@@ -565,18 +580,16 @@ ngx_rtmp_core_listen(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+ 
+     ngx_memzero(ls, sizeof(ngx_rtmp_listen_t));
+ 
++#if (nginx_version >= 1011000)
++    ngx_memcpy(ls->sockaddr, (u_char *) &u.sockaddr, u.socklen);
++#else
+     ngx_memcpy(ls->sockaddr, u.sockaddr, u.socklen);
++#endif
+ 
+     ls->socklen = u.socklen;
+     ls->wildcard = u.wildcard;
+     ls->ctx = cf->ctx;
+ 
+-    for (m = 0; ngx_modules[m]; m++) {
+-        if (ngx_modules[m]->type != NGX_RTMP_MODULE) {
+-            continue;
+-        }
+-    }
+-
+     for (i = 2; i < cf->args->nelts; i++) {
+ 
+         if (ngx_strcmp(value[i].data, "bind") == 0) {
+@@ -586,7 +599,6 @@ ngx_rtmp_core_listen(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+ 
+         if (ngx_strncmp(value[i].data, "ipv6only=o", 10) == 0) {
+ #if (NGX_HAVE_INET6 && defined IPV6_V6ONLY)
+-            struct sockaddr  *sa;
+             u_char            buf[NGX_SOCKADDR_STRLEN];
+ 
+             sa = (struct sockaddr *) ls->sockaddr;
+diff --git a/ngx_rtmp_exec_module.c b/ngx_rtmp_exec_module.c
+index 6f298a7d..ad9011d6 100644
+--- a/ngx_rtmp_exec_module.c
++++ b/ngx_rtmp_exec_module.c
+@@ -20,6 +20,7 @@
+ static ngx_rtmp_publish_pt              next_publish;
+ static ngx_rtmp_play_pt                 next_play;
+ static ngx_rtmp_close_stream_pt         next_close_stream;
++static ngx_rtmp_record_started_pt       next_record_started;
+ static ngx_rtmp_record_done_pt          next_record_done;
+ #endif
+ 
+@@ -55,6 +56,7 @@ enum {
+     NGX_RTMP_EXEC_PUBLISH_DONE,
+     NGX_RTMP_EXEC_PLAY,
+     NGX_RTMP_EXEC_PLAY_DONE,
++    NGX_RTMP_EXEC_RECORD_STARTED,
+     NGX_RTMP_EXEC_RECORD_DONE,
+ 
+     NGX_RTMP_EXEC_MAX,
+@@ -208,6 +210,15 @@ static ngx_command_t  ngx_rtmp_exec_commands[] = {
+       NGX_RTMP_EXEC_PLAY_DONE * sizeof(ngx_array_t),
+       NULL },
+ 
++    { ngx_string("exec_record_started"),
++      NGX_RTMP_MAIN_CONF|NGX_RTMP_SRV_CONF|NGX_RTMP_APP_CONF|NGX_RTMP_REC_CONF|
++                         NGX_CONF_1MORE,
++      ngx_rtmp_exec_conf,
++      NGX_RTMP_APP_CONF_OFFSET,
++      offsetof(ngx_rtmp_exec_app_conf_t, conf) +
++      NGX_RTMP_EXEC_RECORD_STARTED * sizeof(ngx_array_t),
++      NULL },
++
+     { ngx_string("exec_record_done"),
+       NGX_RTMP_MAIN_CONF|NGX_RTMP_SRV_CONF|NGX_RTMP_APP_CONF|NGX_RTMP_REC_CONF|
+                          NGX_CONF_1MORE,
+@@ -1308,6 +1319,31 @@ ngx_rtmp_exec_close_stream(ngx_rtmp_session_t *s, ngx_rtmp_close_stream_t *v)
+ 
+ 
+ static ngx_int_t
++ngx_rtmp_exec_record_started(ngx_rtmp_session_t *s, ngx_rtmp_record_started_t *v)
++{
++    ngx_rtmp_exec_app_conf_t  *eacf;
++
++    if (s->auto_pushed) {
++        goto next;
++    }
++
++    eacf = ngx_rtmp_get_module_app_conf(s, ngx_rtmp_exec_module);
++    if (eacf == NULL || !eacf->active) {
++        goto next;
++    }
++
++    ngx_rtmp_exec_unmanaged(s, &eacf->conf[NGX_RTMP_EXEC_RECORD_STARTED],
++                            "record_started");
++
++    ngx_str_null(&v->recorder);
++    ngx_str_null(&v->path);
++
++next:
++    return next_record_started(s, v);
++}
++
++
++static ngx_int_t
+ ngx_rtmp_exec_record_done(ngx_rtmp_session_t *s, ngx_rtmp_record_done_t *v)
+ {
+     u_char                     c;
+@@ -1364,6 +1400,7 @@ ngx_rtmp_exec_record_done(ngx_rtmp_session_t *s, ngx_rtmp_record_done_t *v)
+ next:
+     return next_record_done(s, v);
+ }
++
+ #endif /* NGX_WIN32 */
+ 
+ 
+@@ -1603,6 +1640,9 @@ ngx_rtmp_exec_postconfiguration(ngx_conf_t *cf)
+     next_record_done = ngx_rtmp_record_done;
+     ngx_rtmp_record_done = ngx_rtmp_exec_record_done;
+ 
++    next_record_started = ngx_rtmp_record_started;
++    ngx_rtmp_record_started = ngx_rtmp_exec_record_started;
++
+ #endif /* NGX_WIN32 */
+ 
+     return NGX_OK;
+diff --git a/ngx_rtmp_handshake.c b/ngx_rtmp_handshake.c
+index d58fcff4..409d9a0d 100644
+--- a/ngx_rtmp_handshake.c
++++ b/ngx_rtmp_handshake.c
+@@ -104,30 +104,37 @@ static ngx_int_t
+ ngx_rtmp_make_digest(ngx_str_t *key, ngx_buf_t *src,
+         u_char *skip, u_char *dst, ngx_log_t *log)
+ {
+-    static HMAC_CTX         hmac;
+-    static unsigned         hmac_initialized;
++    static HMAC_CTX        *hmac;
+     unsigned int            len;
+ 
+-    if (!hmac_initialized) {
+-        HMAC_CTX_init(&hmac);
+-        hmac_initialized = 1;
++    if (hmac == NULL) {
++#if OPENSSL_VERSION_NUMBER < 0x10100000L
++        static HMAC_CTX  shmac;
++        hmac = &shmac;
++        HMAC_CTX_init(hmac);
++#else
++        hmac = HMAC_CTX_new();
++        if (hmac == NULL) {
++            return NGX_ERROR;
++        }
++#endif
+     }
+ 
+-    HMAC_Init_ex(&hmac, key->data, key->len, EVP_sha256(), NULL);
++    HMAC_Init_ex(hmac, key->data, key->len, EVP_sha256(), NULL);
+ 
+     if (skip && src->pos <= skip && skip <= src->last) {
+         if (skip != src->pos) {
+-            HMAC_Update(&hmac, src->pos, skip - src->pos);
++            HMAC_Update(hmac, src->pos, skip - src->pos);
+         }
+         if (src->last != skip + NGX_RTMP_HANDSHAKE_KEYLEN) {
+-            HMAC_Update(&hmac, skip + NGX_RTMP_HANDSHAKE_KEYLEN,
++            HMAC_Update(hmac, skip + NGX_RTMP_HANDSHAKE_KEYLEN,
+                     src->last - skip - NGX_RTMP_HANDSHAKE_KEYLEN);
+         }
+     } else {
+-        HMAC_Update(&hmac, src->pos, src->last - src->pos);
++        HMAC_Update(hmac, src->pos, src->last - src->pos);
+     }
+ 
+-    HMAC_Final(&hmac, dst, &len);
++    HMAC_Final(hmac, dst, &len);
+ 
+     return NGX_OK;
+ }
+diff --git a/ngx_rtmp_live_module.c b/ngx_rtmp_live_module.c
+index 8db2016a..d0ee9c88 100644
+--- a/ngx_rtmp_live_module.c
++++ b/ngx_rtmp_live_module.c
+@@ -40,16 +40,16 @@ static ngx_command_t  ngx_rtmp_live_commands[] = {
+ 
+     { ngx_string("stream_buckets"),
+       NGX_RTMP_MAIN_CONF|NGX_RTMP_SRV_CONF|NGX_RTMP_APP_CONF|NGX_CONF_TAKE1,
+-      ngx_conf_set_str_slot,
++      ngx_conf_set_num_slot,
+       NGX_RTMP_APP_CONF_OFFSET,
+       offsetof(ngx_rtmp_live_app_conf_t, nbuckets),
+       NULL },
+ 
+     { ngx_string("buffer"),
+       NGX_RTMP_MAIN_CONF|NGX_RTMP_SRV_CONF|NGX_RTMP_APP_CONF|NGX_CONF_TAKE1,
+-      ngx_conf_set_msec_slot,
++      ngx_conf_set_flag_slot,
+       NGX_RTMP_APP_CONF_OFFSET,
+-      offsetof(ngx_rtmp_live_app_conf_t, buflen),
++      offsetof(ngx_rtmp_live_app_conf_t, buffer),
+       NULL },
+ 
+     { ngx_string("sync"),
+@@ -152,7 +152,7 @@ ngx_rtmp_live_create_app_conf(ngx_conf_t *cf)
+ 
+     lacf->live = NGX_CONF_UNSET;
+     lacf->nbuckets = NGX_CONF_UNSET;
+-    lacf->buflen = NGX_CONF_UNSET_MSEC;
++    lacf->buffer = NGX_CONF_UNSET;
+     lacf->sync = NGX_CONF_UNSET_MSEC;
+     lacf->idle_timeout = NGX_CONF_UNSET_MSEC;
+     lacf->interleave = NGX_CONF_UNSET;
+@@ -174,7 +174,7 @@ ngx_rtmp_live_merge_app_conf(ngx_conf_t *cf, void *parent, void *child)
+ 
+     ngx_conf_merge_value(conf->live, prev->live, 0);
+     ngx_conf_merge_value(conf->nbuckets, prev->nbuckets, 1024);
+-    ngx_conf_merge_msec_value(conf->buflen, prev->buflen, 0);
++    ngx_conf_merge_value(conf->buffer, prev->buffer, 0);
+     ngx_conf_merge_msec_value(conf->sync, prev->sync, 300);
+     ngx_conf_merge_msec_value(conf->idle_timeout, prev->idle_timeout, 0);
+     ngx_conf_merge_value(conf->interleave, prev->interleave, 0);
+@@ -553,7 +553,7 @@ ngx_rtmp_live_join(ngx_rtmp_session_t *s, u_char *name, unsigned publisher)
+ 
+     (*stream)->ctx = ctx;
+ 
+-    if (lacf->buflen) {
++    if (lacf->buffer) {
+         s->out_buffer = 1;
+     }
+ 
+@@ -1142,7 +1142,7 @@ ngx_rtmp_live_data(ngx_rtmp_session_t *s, ngx_rtmp_header_t *h,
+         ngx_rtmp_free_shared_chain(cscf, data);
+     }
+ 
+-    if (rpkt) {
++    if (rpkt && !data) {
+         ngx_rtmp_free_shared_chain(cscf, rpkt);
+     }
+ 
+diff --git a/ngx_rtmp_live_module.h b/ngx_rtmp_live_module.h
+index 1eb59d4d..2558ed55 100644
+--- a/ngx_rtmp_live_module.h
++++ b/ngx_rtmp_live_module.h
+@@ -72,7 +72,7 @@ typedef struct {
+     ngx_flag_t                          publish_notify;
+     ngx_flag_t                          play_restart;
+     ngx_flag_t                          idle_streams;
+-    ngx_msec_t                          buflen;
++    ngx_flag_t                          buffer;
+     ngx_pool_t                         *pool;
+     ngx_rtmp_live_stream_t             *free_streams;
+ } ngx_rtmp_live_app_conf_t;
+diff --git a/ngx_rtmp_netcall_module.c b/ngx_rtmp_netcall_module.c
+index f772c723..24c001cb 100644
+--- a/ngx_rtmp_netcall_module.c
++++ b/ngx_rtmp_netcall_module.c
+@@ -571,6 +571,7 @@ ngx_rtmp_netcall_http_format_session(ngx_rtmp_session_t *s, ngx_pool_t *pool)
+     ngx_chain_t                    *cl;
+     ngx_buf_t                      *b;
+     ngx_str_t                      *addr_text;
++    size_t                          bsize;
+ 
+     addr_text = &s->connection->addr_text;
+ 
+@@ -579,16 +580,32 @@ ngx_rtmp_netcall_http_format_session(ngx_rtmp_session_t *s, ngx_pool_t *pool)
+         return NULL;
+     }
+ 
+-    b = ngx_create_temp_buf(pool,
+-            sizeof("app=") - 1 + s->app.len * 3 +
+-            sizeof("&flashver=") - 1 + s->flashver.len * 3 +
+-            sizeof("&swfurl=") - 1 + s->swf_url.len * 3 +
+-            sizeof("&tcurl=") - 1 + s->tc_url.len * 3 +
+-            sizeof("&pageurl=") - 1 + s->page_url.len * 3 +
+-            sizeof("&addr=") - 1 + addr_text->len * 3 +
+-            sizeof("&clientid=") - 1 + NGX_INT_T_LEN
+-        );
++    /**
++     * @2016-04-20 sergey-dryabzhinsky
++     * Not all params may be filled in session
++     * So not override them with empty values
++     */
+ 
++    bsize = sizeof("&addr=") - 1 + addr_text->len * 3 +
++            sizeof("&clientid=") - 1 + NGX_INT_T_LEN;
++
++    if (s->app.len) {
++        bsize += sizeof("app=") - 1 + s->app.len * 3;
++    }
++    if (s->flashver.len) {
++        bsize += sizeof("&flashver=") - 1 + s->flashver.len * 3;
++    }
++    if (s->swf_url.len) {
++        bsize += sizeof("&swfurl=") - 1 + s->swf_url.len * 3;
++    }
++    if (s->tc_url.len) {
++        bsize += sizeof("&tcurl=") - 1 + s->tc_url.len * 3;
++    }
++    if (s->page_url.len) {
++        bsize += sizeof("&pageurl=") - 1 + s->page_url.len * 3;
++    }
++
++    b = ngx_create_temp_buf(pool, bsize);
+     if (b == NULL) {
+         return NULL;
+     }
+@@ -596,29 +613,35 @@ ngx_rtmp_netcall_http_format_session(ngx_rtmp_session_t *s, ngx_pool_t *pool)
+     cl->buf = b;
+     cl->next = NULL;
+ 
+-    b->last = ngx_cpymem(b->last, (u_char*) "app=", sizeof("app=") - 1);
+-    b->last = (u_char*) ngx_escape_uri(b->last, s->app.data, s->app.len,
+-                                       NGX_ESCAPE_ARGS);
+-
+-    b->last = ngx_cpymem(b->last, (u_char*) "&flashver=",
+-                         sizeof("&flashver=") - 1);
+-    b->last = (u_char*) ngx_escape_uri(b->last, s->flashver.data,
+-                                       s->flashver.len, NGX_ESCAPE_ARGS);
+-
+-    b->last = ngx_cpymem(b->last, (u_char*) "&swfurl=",
+-                         sizeof("&swfurl=") - 1);
+-    b->last = (u_char*) ngx_escape_uri(b->last, s->swf_url.data,
+-                                       s->swf_url.len, NGX_ESCAPE_ARGS);
+-
+-    b->last = ngx_cpymem(b->last, (u_char*) "&tcurl=",
+-                         sizeof("&tcurl=") - 1);
+-    b->last = (u_char*) ngx_escape_uri(b->last, s->tc_url.data,
+-                                       s->tc_url.len, NGX_ESCAPE_ARGS);
+-
+-    b->last = ngx_cpymem(b->last, (u_char*) "&pageurl=",
+-                         sizeof("&pageurl=") - 1);
+-    b->last = (u_char*) ngx_escape_uri(b->last, s->page_url.data,
+-                                       s->page_url.len, NGX_ESCAPE_ARGS);
++    if (s->app.len) {
++        b->last = ngx_cpymem(b->last, (u_char*) "app=", sizeof("app=") - 1);
++        b->last = (u_char*) ngx_escape_uri(b->last, s->app.data, s->app.len,
++                                           NGX_ESCAPE_ARGS);
++    }
++    if (s->flashver.len) {
++        b->last = ngx_cpymem(b->last, (u_char*) "&flashver=",
++                             sizeof("&flashver=") - 1);
++        b->last = (u_char*) ngx_escape_uri(b->last, s->flashver.data,
++                                           s->flashver.len, NGX_ESCAPE_ARGS);
++    }
++    if (s->swf_url.len) {
++        b->last = ngx_cpymem(b->last, (u_char*) "&swfurl=",
++                             sizeof("&swfurl=") - 1);
++        b->last = (u_char*) ngx_escape_uri(b->last, s->swf_url.data,
++                                           s->swf_url.len, NGX_ESCAPE_ARGS);
++    }
++    if (s->tc_url.len) {
++        b->last = ngx_cpymem(b->last, (u_char*) "&tcurl=",
++                             sizeof("&tcurl=") - 1);
++        b->last = (u_char*) ngx_escape_uri(b->last, s->tc_url.data,
++                                           s->tc_url.len, NGX_ESCAPE_ARGS);
++    }
++    if (s->page_url.len) {
++        b->last = ngx_cpymem(b->last, (u_char*) "&pageurl=",
++                             sizeof("&pageurl=") - 1);
++        b->last = (u_char*) ngx_escape_uri(b->last, s->page_url.data,
++                                           s->page_url.len, NGX_ESCAPE_ARGS);
++    }
+ 
+     b->last = ngx_cpymem(b->last, (u_char*) "&addr=", sizeof("&addr=") - 1);
+     b->last = (u_char*) ngx_escape_uri(b->last, addr_text->data,
+diff --git a/ngx_rtmp_notify_module.c b/ngx_rtmp_notify_module.c
+index d370bc16..78f31ba1 100644
+--- a/ngx_rtmp_notify_module.c
++++ b/ngx_rtmp_notify_module.c
+@@ -19,6 +19,7 @@ static ngx_rtmp_disconnect_pt                   next_disconnect;
+ static ngx_rtmp_publish_pt                      next_publish;
+ static ngx_rtmp_play_pt                         next_play;
+ static ngx_rtmp_close_stream_pt                 next_close_stream;
++static ngx_rtmp_record_started_pt               next_record_started;
+ static ngx_rtmp_record_done_pt                  next_record_done;
+ static ngx_rtmp_playlist_pt                     next_playlist;
+ 
+@@ -56,6 +57,7 @@ enum {
+     NGX_RTMP_NOTIFY_PLAY_DONE,
+     NGX_RTMP_NOTIFY_PUBLISH_DONE,
+     NGX_RTMP_NOTIFY_DONE,
++    NGX_RTMP_NOTIFY_RECORD_STARTED,
+     NGX_RTMP_NOTIFY_RECORD_DONE,
+     NGX_RTMP_NOTIFY_UPDATE,
+     NGX_RTMP_NOTIFY_PLAYLIST,
+@@ -154,6 +156,14 @@ static ngx_command_t  ngx_rtmp_notify_commands[] = {
+       0,
+       NULL },
+ 
++    { ngx_string("on_record_started"),
++      NGX_RTMP_MAIN_CONF|NGX_RTMP_SRV_CONF|NGX_RTMP_APP_CONF|NGX_RTMP_REC_CONF|
++                         NGX_CONF_TAKE1,
++      ngx_rtmp_notify_on_app_event,
++      NGX_RTMP_APP_CONF_OFFSET,
++      0,
++      NULL },
++
+     { ngx_string("on_record_done"),
+       NGX_RTMP_MAIN_CONF|NGX_RTMP_SRV_CONF|NGX_RTMP_APP_CONF|NGX_RTMP_REC_CONF|
+                          NGX_CONF_TAKE1,
+@@ -347,15 +357,35 @@ ngx_rtmp_notify_create_request(ngx_rtmp_session_t *s, ngx_pool_t *pool,
+     ngx_chain_t                *al, *bl, *cl;
+     ngx_url_t                  *url;
+ 
++    ngx_log_debug0(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
++            "notify: create request: begin");
++
+     nacf = ngx_rtmp_get_module_app_conf(s, ngx_rtmp_notify_module);
+ 
+     url = nacf->url[url_idx];
+ 
++    ngx_log_debug0(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
++            "notify: create request: netcall format session");
++
+     al = ngx_rtmp_netcall_http_format_session(s, pool);
+     if (al == NULL) {
+         return NULL;
+     }
+ 
++    // Swap args and fulled session params chain
++    // Because nginx-rtmp session params are higher priority
++    // And must be last in chain to prevent override.
++    // So.
++    // In args first symbol IS NOT '&', but LAST ONE
++    if (args) {
++        ngx_log_debug0(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
++                "notify: create request: swap formated args");
++
++        cl = args;
++        args = al;
++        al = cl;
++    }
++
+     al->next = args;
+ 
+     bl = NULL;
+@@ -366,6 +396,9 @@ ngx_rtmp_notify_create_request(ngx_rtmp_session_t *s, ngx_pool_t *pool,
+         bl = cl;
+     }
+ 
++    ngx_log_debug0(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
++            "notify: create request: netcall format request");
++
+     return ngx_rtmp_netcall_http_format_request(nacf->method, &url->host,
+                                                 &url->uri, al, bl, pool,
+                                                 &ngx_rtmp_notify_urlencoded);
+@@ -373,26 +406,80 @@ ngx_rtmp_notify_create_request(ngx_rtmp_session_t *s, ngx_pool_t *pool,
+ 
+ 
+ static ngx_chain_t *
++ngx_rtmp_notify_create_srv_request(ngx_rtmp_session_t *s, ngx_pool_t *pool,
++                                   ngx_uint_t url_idx, ngx_chain_t *args)
++{
++    ngx_rtmp_notify_srv_conf_t *nscf;
++    ngx_chain_t                *al, *bl, *cl;
++    ngx_url_t                  *url;
++
++    ngx_log_debug0(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
++            "notify: create srv request: begin");
++
++    nscf = ngx_rtmp_get_module_srv_conf(s, ngx_rtmp_notify_module);
++
++    url = nscf->url[url_idx];
++
++    ngx_log_debug0(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
++            "notify: create srv request: netcall format session");
++
++    al = ngx_rtmp_netcall_http_format_session(s, pool);
++    if (al == NULL) {
++        return NULL;
++    }
++
++    // Swap args and fulled session params chain
++    // Because nginx-rtmp session params are higher priority
++    // And must be last in chain to prevent override.
++    // So.
++    // In args first symbol IS NOT '&', but LAST ONE
++    if (args) {
++        ngx_log_debug0(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
++                "notify: create srv request: swap formated args");
++
++        cl = args;
++        args = al;
++        al = cl;
++    }
++
++    al->next = args;
++
++    bl = NULL;
++
++    if (nscf->method == NGX_RTMP_NETCALL_HTTP_POST) {
++        cl = al;
++        al = bl;
++        bl = cl;
++    }
++
++    ngx_log_debug0(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
++            "notify: create srv request: netcall format request");
++
++    return ngx_rtmp_netcall_http_format_request(nscf->method, &url->host,
++                                                &url->uri, al, bl, pool,
++                                                &ngx_rtmp_notify_urlencoded);
++}
++
++
++static ngx_chain_t *
+ ngx_rtmp_notify_connect_create(ngx_rtmp_session_t *s, void *arg,
+         ngx_pool_t *pool)
+ {
+     ngx_rtmp_connect_t             *v = arg;
+ 
+-    ngx_rtmp_notify_srv_conf_t     *nscf;
+-    ngx_url_t                      *url;
+-    ngx_chain_t                    *al, *bl;
++    ngx_chain_t                    *al;
+     ngx_buf_t                      *b;
+-    ngx_str_t                      *addr_text;
+     size_t                          app_len, args_len, flashver_len,
+                                     swf_url_len, tc_url_len, page_url_len;
+ 
+-    nscf = ngx_rtmp_get_module_srv_conf(s, ngx_rtmp_notify_module);
+-
+     al = ngx_alloc_chain_link(pool);
+     if (al == NULL) {
+         return NULL;
+     }
+ 
++    ngx_log_debug0(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
++            "notify: connect: begin");
++
+     /* these values are still missing in session
+      * so we have to construct the request from
+      * connection struct */
+@@ -404,18 +491,15 @@ ngx_rtmp_notify_connect_create(ngx_rtmp_session_t *s, void *arg,
+     tc_url_len = ngx_strlen(v->tc_url);
+     page_url_len = ngx_strlen(v->page_url);
+ 
+-    addr_text = &s->connection->addr_text;
+-
+     b = ngx_create_temp_buf(pool,
+-            sizeof("call=connect") - 1 +
++            sizeof("call=connect") +
+             sizeof("&app=") - 1 + app_len * 3 +
+             sizeof("&flashver=") - 1 + flashver_len * 3 +
+             sizeof("&swfurl=") - 1 + swf_url_len * 3 +
+             sizeof("&tcurl=") - 1 + tc_url_len * 3 +
+             sizeof("&pageurl=") - 1 + page_url_len * 3 +
+-            sizeof("&addr=") - 1 + addr_text->len * 3 +
+             sizeof("&epoch=") - 1 + NGX_INT32_LEN +
+-            1 + args_len
++            1 + args_len + 1
+         );
+ 
+     if (b == NULL) {
+@@ -425,7 +509,15 @@ ngx_rtmp_notify_connect_create(ngx_rtmp_session_t *s, void *arg,
+     al->buf = b;
+     al->next = NULL;
+ 
+-    b->last = ngx_cpymem(b->last, (u_char*) "app=", sizeof("app=") - 1);
++    if (args_len) {
++        b->last = (u_char *) ngx_cpymem(b->last, v->args, args_len);
++        *b->last++ = '&';
++    }
++
++    b->last = ngx_cpymem(b->last, (u_char*) "call=connect",
++                         sizeof("call=connect") - 1);
++
++    b->last = ngx_cpymem(b->last, (u_char*) "&app=", sizeof("&app=") - 1);
+     b->last = (u_char*) ngx_escape_uri(b->last, v->app, app_len,
+                                        NGX_ESCAPE_ARGS);
+ 
+@@ -449,33 +541,12 @@ ngx_rtmp_notify_connect_create(ngx_rtmp_session_t *s, void *arg,
+     b->last = (u_char*) ngx_escape_uri(b->last, v->page_url, page_url_len,
+                                        NGX_ESCAPE_ARGS);
+ 
+-    b->last = ngx_cpymem(b->last, (u_char*) "&addr=", sizeof("&addr=") -1);
+-    b->last = (u_char*) ngx_escape_uri(b->last, addr_text->data,
+-                                       addr_text->len, NGX_ESCAPE_ARGS);
+-
+     b->last = ngx_cpymem(b->last, (u_char*) "&epoch=", sizeof("&epoch=") -1);
+     b->last = ngx_sprintf(b->last, "%uD", (uint32_t) s->epoch);
+ 
+-    b->last = ngx_cpymem(b->last, (u_char*) "&call=connect",
+-                         sizeof("&call=connect") - 1);
+-
+-    if (args_len) {
+-        *b->last++ = '&';
+-        b->last = (u_char *) ngx_cpymem(b->last, v->args, args_len);
+-    }
+-
+-    url = nscf->url[NGX_RTMP_NOTIFY_CONNECT];
+-
+-    bl = NULL;
++    *b->last++ = '&';
+ 
+-    if (nscf->method == NGX_RTMP_NETCALL_HTTP_POST) {
+-        bl = al;
+-        al = NULL;
+-    }
+-
+-    return ngx_rtmp_netcall_http_format_request(nscf->method, &url->host,
+-                                                &url->uri, al, bl, pool,
+-                                                &ngx_rtmp_notify_urlencoded);
++    return ngx_rtmp_notify_create_srv_request(s, pool, NGX_RTMP_NOTIFY_CONNECT, al);
+ }
+ 
+ 
+@@ -483,24 +554,20 @@ static ngx_chain_t *
+ ngx_rtmp_notify_disconnect_create(ngx_rtmp_session_t *s, void *arg,
+         ngx_pool_t *pool)
+ {
+-    ngx_rtmp_notify_srv_conf_t     *nscf;
+-    ngx_url_t                      *url;
+-    ngx_chain_t                    *al, *bl, *pl;
++    ngx_chain_t                    *pl;
+     ngx_buf_t                      *b;
+ 
+-    nscf = ngx_rtmp_get_module_srv_conf(s, ngx_rtmp_notify_module);
+-
+     pl = ngx_alloc_chain_link(pool);
+     if (pl == NULL) {
+         return NULL;
+     }
+ 
+     b = ngx_create_temp_buf(pool,
+-            sizeof("&call=disconnect") +
+-            sizeof("&app=") + s->app.len * 3 +
++            sizeof("call=disconnect") +
+             sizeof("&bytes_in=") - 1 + NGX_INT32_LEN +
+             sizeof("&bytes_out=") - 1 + NGX_INT32_LEN +
+-            1 + s->args.len);
++            1 + s->args.len + 1);
++
+     if (b == NULL) {
+         return NULL;
+     }
+@@ -508,12 +575,13 @@ ngx_rtmp_notify_disconnect_create(ngx_rtmp_session_t *s, void *arg,
+     pl->buf = b;
+     pl->next = NULL;
+ 
+-    b->last = ngx_cpymem(b->last, (u_char*) "&call=disconnect",
+-                         sizeof("&call=disconnect") - 1);
++    if (s->args.len) {
++        b->last = (u_char *) ngx_cpymem(b->last, s->args.data, s->args.len);
++        *b->last++ = '&';
++    }
+ 
+-    b->last = ngx_cpymem(b->last, (u_char*) "&app=", sizeof("&app=") - 1);
+-    b->last = (u_char*) ngx_escape_uri(b->last, s->app.data, s->app.len,
+-                                       NGX_ESCAPE_ARGS);
++    b->last = ngx_cpymem(b->last, (u_char*) "call=disconnect",
++                         sizeof("call=disconnect") - 1);
+ 
+     b->last = ngx_cpymem(b->last, (u_char*) "&bytes_in=", sizeof("&bytes_in=") -1);
+     b->last = ngx_sprintf(b->last, "%ui", (ngx_uint_t) s->in_bytes);
+@@ -521,30 +589,9 @@ ngx_rtmp_notify_disconnect_create(ngx_rtmp_session_t *s, void *arg,
+     b->last = ngx_cpymem(b->last, (u_char*) "&bytes_out=", sizeof("&bytes_out=") -1);
+     b->last = ngx_sprintf(b->last, "%ui", (ngx_uint_t) s->out_bytes);
+ 
+-    if (s->args.len) {
+-        *b->last++ = '&';
+-        b->last = (u_char *) ngx_cpymem(b->last, s->args.data, s->args.len);
+-    }
+-
+-    url = nscf->url[NGX_RTMP_NOTIFY_DISCONNECT];
+-
+-    al = ngx_rtmp_netcall_http_format_session(s, pool);
+-    if (al == NULL) {
+-        return NULL;
+-    }
+-
+-    al->next = pl;
+-
+-    bl = NULL;
++    *b->last++ = '&';
+ 
+-    if (nscf->method == NGX_RTMP_NETCALL_HTTP_POST) {
+-        bl = al;
+-        al = NULL;
+-    }
+-
+-    return ngx_rtmp_netcall_http_format_request(nscf->method, &url->host,
+-                                                &url->uri, al, bl, pool,
+-                                                &ngx_rtmp_notify_urlencoded);
++    return ngx_rtmp_notify_create_srv_request(s, pool, NGX_RTMP_NOTIFY_DISCONNECT, pl);
+ }
+ 
+ 
+@@ -568,11 +615,10 @@ ngx_rtmp_notify_publish_create(ngx_rtmp_session_t *s, void *arg,
+     args_len = ngx_strlen(v->args);
+ 
+     b = ngx_create_temp_buf(pool,
+-                            sizeof("&call=publish") +
+-                            sizeof("&app=") + s->app.len * 3 +
++                            sizeof("call=publish") +
+                             sizeof("&name=") + name_len * 3 +
+                             sizeof("&type=") + type_len * 3 +
+-                            1 + args_len);
++                            1 + args_len + 1);
+     if (b == NULL) {
+         return NULL;
+     }
+@@ -580,12 +626,13 @@ ngx_rtmp_notify_publish_create(ngx_rtmp_session_t *s, void *arg,
+     pl->buf = b;
+     pl->next = NULL;
+ 
+-    b->last = ngx_cpymem(b->last, (u_char*) "&call=publish",
+-                         sizeof("&call=publish") - 1);
++    if (args_len) {
++        b->last = (u_char *) ngx_cpymem(b->last, v->args, args_len);
++        *b->last++ = '&';
++    }
+ 
+-    b->last = ngx_cpymem(b->last, (u_char*) "&app=", sizeof("&app=") - 1);
+-    b->last = (u_char*) ngx_escape_uri(b->last, s->app.data, s->app.len,
+-                                       NGX_ESCAPE_ARGS);
++    b->last = ngx_cpymem(b->last, (u_char*) "call=publish",
++                         sizeof("call=publish") - 1);
+ 
+     b->last = ngx_cpymem(b->last, (u_char*) "&name=", sizeof("&name=") - 1);
+     b->last = (u_char*) ngx_escape_uri(b->last, v->name, name_len,
+@@ -595,10 +642,7 @@ ngx_rtmp_notify_publish_create(ngx_rtmp_session_t *s, void *arg,
+     b->last = (u_char*) ngx_escape_uri(b->last, v->type, type_len,
+                                        NGX_ESCAPE_ARGS);
+ 
+-    if (args_len) {
+-        *b->last++ = '&';
+-        b->last = (u_char *) ngx_cpymem(b->last, v->args, args_len);
+-    }
++    *b->last++ = '&';
+ 
+     return ngx_rtmp_notify_create_request(s, pool, NGX_RTMP_NOTIFY_PUBLISH, pl);
+ }
+@@ -623,11 +667,10 @@ ngx_rtmp_notify_play_create(ngx_rtmp_session_t *s, void *arg,
+     args_len = ngx_strlen(v->args);
+ 
+     b = ngx_create_temp_buf(pool,
+-                            sizeof("&call=play") +
+-                            sizeof("&app=") + s->app.len * 3 +
++                            sizeof("call=play") +
+                             sizeof("&name=") + name_len * 3 +
+                             sizeof("&start=&duration=&reset=") +
+-                            NGX_INT32_LEN * 3 + 1 + args_len);
++                            NGX_INT32_LEN * 3 + 1 + args_len + 1);
+     if (b == NULL) {
+         return NULL;
+     }
+@@ -635,12 +678,13 @@ ngx_rtmp_notify_play_create(ngx_rtmp_session_t *s, void *arg,
+     pl->buf = b;
+     pl->next = NULL;
+ 
+-    b->last = ngx_cpymem(b->last, (u_char*) "&call=play",
+-                         sizeof("&call=play") - 1);
++    if (args_len) {
++        b->last = (u_char *) ngx_cpymem(b->last, v->args, args_len);
++        *b->last++ = '&';
++    }
+ 
+-    b->last = ngx_cpymem(b->last, (u_char*) "&app=", sizeof("&app=") - 1);
+-    b->last = (u_char*) ngx_escape_uri(b->last, s->app.data, s->app.len,
+-                                       NGX_ESCAPE_ARGS);
++    b->last = ngx_cpymem(b->last, (u_char*) "call=play",
++                         sizeof("call=play") - 1);
+ 
+     b->last = ngx_cpymem(b->last, (u_char*) "&name=", sizeof("&name=") - 1);
+     b->last = (u_char*) ngx_escape_uri(b->last, v->name, name_len,
+@@ -651,10 +695,7 @@ ngx_rtmp_notify_play_create(ngx_rtmp_session_t *s, void *arg,
+                            (uint32_t) v->start, (uint32_t) v->duration,
+                            v->reset & 1);
+ 
+-    if (args_len) {
+-        *b->last++ = '&';
+-        b->last = (u_char *) ngx_cpymem(b->last, v->args, args_len);
+-    }
++    *b->last++ = '&';
+ 
+     return ngx_rtmp_notify_create_request(s, pool, NGX_RTMP_NOTIFY_PLAY, pl);
+ }
+@@ -683,12 +724,11 @@ ngx_rtmp_notify_done_create(ngx_rtmp_session_t *s, void *arg,
+     args_len = ctx ? ngx_strlen(ctx->args) : 0;
+ 
+     b = ngx_create_temp_buf(pool,
+-            sizeof("&call=") + cbname_len +
+-            sizeof("&app=") + s->app.len * 3 +
++            sizeof("call=") + cbname_len +
+             sizeof("&name=") + name_len * 3 +
+             sizeof("&bytes_in=") - 1 + NGX_INT32_LEN +
+             sizeof("&bytes_out=") - 1 + NGX_INT32_LEN +
+-            1 + args_len);
++            1 + args_len + 1);
+ 
+     if (b == NULL) {
+         return NULL;
+@@ -697,12 +737,13 @@ ngx_rtmp_notify_done_create(ngx_rtmp_session_t *s, void *arg,
+     pl->buf = b;
+     pl->next = NULL;
+ 
+-    b->last = ngx_cpymem(b->last, (u_char*) "&call=", sizeof("&call=") - 1);
+-    b->last = ngx_cpymem(b->last, ds->cbname, cbname_len);
++    if (args_len) {
++        b->last = (u_char *) ngx_cpymem(b->last, ctx->args, args_len);
++        *b->last++ = '&';
++    }
+ 
+-    b->last = ngx_cpymem(b->last, (u_char*) "&app=", sizeof("&app=") - 1);
+-    b->last = (u_char*) ngx_escape_uri(b->last, s->app.data, s->app.len,
+-                                       NGX_ESCAPE_ARGS);
++    b->last = ngx_cpymem(b->last, (u_char*) "call=", sizeof("call=") - 1);
++    b->last = ngx_cpymem(b->last, ds->cbname, cbname_len);
+ 
+     if (name_len) {
+         b->last = ngx_cpymem(b->last, (u_char*) "&name=", sizeof("&name=") - 1);
+@@ -716,10 +757,7 @@ ngx_rtmp_notify_done_create(ngx_rtmp_session_t *s, void *arg,
+     b->last = ngx_cpymem(b->last, (u_char*) "&bytes_out=", sizeof("&bytes_out=") -1);
+     b->last = ngx_sprintf(b->last, "%ui", (ngx_uint_t) s->out_bytes);
+ 
+-    if (args_len) {
+-        *b->last++ = '&';
+-        b->last = (u_char *) ngx_cpymem(b->last, ctx->args, args_len);
+-    }
++    *b->last++ = '&';
+ 
+     return ngx_rtmp_notify_create_request(s, pool, ds->url_idx, pl);
+ }
+@@ -754,12 +792,11 @@ ngx_rtmp_notify_update_create(ngx_rtmp_session_t *s, void *arg,
+     args_len = ctx ? ngx_strlen(ctx->args) : 0;
+ 
+     b = ngx_create_temp_buf(pool,
+-                            sizeof("&call=update") + sfx.len +
++                            sizeof("call=update") + sfx.len +
+                             sizeof("&time=") + NGX_TIME_T_LEN +
+                             sizeof("&timestamp=") + NGX_INT32_LEN +
+-                            sizeof("&app=") + s->app.len * 3 +
+                             sizeof("&name=") + name_len * 3 +
+-                            1 + args_len);
++                            1 + args_len + 1);
+     if (b == NULL) {
+         return NULL;
+     }
+@@ -767,8 +804,13 @@ ngx_rtmp_notify_update_create(ngx_rtmp_session_t *s, void *arg,
+     pl->buf = b;
+     pl->next = NULL;
+ 
+-    b->last = ngx_cpymem(b->last, (u_char*) "&call=update",
+-                         sizeof("&call=update") - 1);
++    if (args_len) {
++        b->last = (u_char *) ngx_cpymem(b->last, ctx->args, args_len);
++        *b->last++ = '&';
++    }
++
++    b->last = ngx_cpymem(b->last, (u_char*) "call=update",
++                         sizeof("call=update") - 1);
+     b->last = ngx_cpymem(b->last, sfx.data, sfx.len);
+ 
+     b->last = ngx_cpymem(b->last, (u_char *) "&time=",
+@@ -779,22 +821,78 @@ ngx_rtmp_notify_update_create(ngx_rtmp_session_t *s, void *arg,
+                          sizeof("&timestamp=") - 1);
+     b->last = ngx_sprintf(b->last, "%D", s->current_time);
+ 
+-    b->last = ngx_cpymem(b->last, (u_char*) "&app=", sizeof("&app=") - 1);
+-    b->last = (u_char*) ngx_escape_uri(b->last, s->app.data, s->app.len,
+-                                       NGX_ESCAPE_ARGS);
+-
+     if (name_len) {
+         b->last = ngx_cpymem(b->last, (u_char*) "&name=", sizeof("&name=") - 1);
+         b->last = (u_char*) ngx_escape_uri(b->last, ctx->name, name_len,
+                                            NGX_ESCAPE_ARGS);
+     }
+ 
++    *b->last++ = '&';
++
++    return ngx_rtmp_notify_create_request(s, pool, NGX_RTMP_NOTIFY_UPDATE, pl);
++}
++
++
++static ngx_chain_t *
++ngx_rtmp_notify_record_started_create(ngx_rtmp_session_t *s, void *arg,
++                                   ngx_pool_t *pool)
++{
++    ngx_rtmp_record_started_t         *v = arg;
++
++    ngx_rtmp_notify_ctx_t          *ctx;
++    ngx_chain_t                    *pl;
++    ngx_buf_t                      *b;
++    size_t                          name_len, args_len;
++
++    ctx = ngx_rtmp_get_module_ctx(s, ngx_rtmp_notify_module);
++
++    pl = ngx_alloc_chain_link(pool);
++    if (pl == NULL) {
++        return NULL;
++    }
++
++    name_len  = ngx_strlen(ctx->name);
++    args_len  = ngx_strlen(ctx->args);
++
++    b = ngx_create_temp_buf(pool,
++            sizeof("call=record_started") +
++            sizeof("&recorder=") + v->recorder.len +
++            sizeof("&name=") + name_len * 3 +
++            sizeof("&path=") + v->path.len * 3 +
++            1 + args_len + 1);
++
++    if (b == NULL) {
++        return NULL;
++    }
++
++    pl->buf = b;
++    pl->next = NULL;
++
+     if (args_len) {
+-        *b->last++ = '&';
+         b->last = (u_char *) ngx_cpymem(b->last, ctx->args, args_len);
++        *b->last++ = '&';
+     }
+ 
+-    return ngx_rtmp_notify_create_request(s, pool, NGX_RTMP_NOTIFY_UPDATE, pl);
++    b->last = ngx_cpymem(b->last, (u_char*) "call=record_started",
++                         sizeof("call=record_started") - 1);
++
++    b->last = ngx_cpymem(b->last, (u_char *) "&recorder=",
++                         sizeof("&recorder=") - 1);
++    b->last = (u_char*) ngx_escape_uri(b->last, v->recorder.data,
++                                       v->recorder.len, NGX_ESCAPE_ARGS);
++
++    b->last = ngx_cpymem(b->last, (u_char*) "&name=", sizeof("&name=") - 1);
++    b->last = (u_char*) ngx_escape_uri(b->last, ctx->name, name_len,
++                                       NGX_ESCAPE_ARGS);
++
++    b->last = ngx_cpymem(b->last, (u_char*) "&path=", sizeof("&path=") - 1);
++    b->last = (u_char*) ngx_escape_uri(b->last, v->path.data, v->path.len,
++                                       NGX_ESCAPE_ARGS);
++
++    *b->last++ = '&';
++
++    return ngx_rtmp_notify_create_request(s, pool, NGX_RTMP_NOTIFY_RECORD_STARTED,
++                                          pl);
+ }
+ 
+ 
+@@ -820,14 +918,13 @@ ngx_rtmp_notify_record_done_create(ngx_rtmp_session_t *s, void *arg,
+     args_len  = ngx_strlen(ctx->args);
+ 
+     b = ngx_create_temp_buf(pool,
+-            sizeof("&call=record_done") +
+-            sizeof("&app=") + s->app.len * 3 +
++            sizeof("call=record_done") +
+             sizeof("&recorder=") + v->recorder.len +
+             sizeof("&name=") + name_len * 3 +
+             sizeof("&path=") + v->path.len * 3 +
+             sizeof("&bytes_in=") - 1 + NGX_INT32_LEN +
+             sizeof("&bytes_out=") - 1 + NGX_INT32_LEN +
+-            1 + args_len);
++            1 + args_len + 1);
+ 
+     if (b == NULL) {
+         return NULL;
+@@ -836,12 +933,13 @@ ngx_rtmp_notify_record_done_create(ngx_rtmp_session_t *s, void *arg,
+     pl->buf = b;
+     pl->next = NULL;
+ 
+-    b->last = ngx_cpymem(b->last, (u_char*) "&call=record_done",
+-                         sizeof("&call=record_done") - 1);
++    if (args_len) {
++        b->last = (u_char *) ngx_cpymem(b->last, ctx->args, args_len);
++        *b->last++ = '&';
++    }
+ 
+-    b->last = ngx_cpymem(b->last, (u_char*) "&app=", sizeof("&app=") - 1);
+-    b->last = (u_char*) ngx_escape_uri(b->last, s->app.data, s->app.len,
+-                                       NGX_ESCAPE_ARGS);
++    b->last = ngx_cpymem(b->last, (u_char*) "call=record_done",
++                         sizeof("call=record_done") - 1);
+ 
+     b->last = ngx_cpymem(b->last, (u_char *) "&recorder=",
+                          sizeof("&recorder=") - 1);
+@@ -862,10 +960,7 @@ ngx_rtmp_notify_record_done_create(ngx_rtmp_session_t *s, void *arg,
+     b->last = ngx_cpymem(b->last, (u_char*) "&bytes_out=", sizeof("&bytes_out=") -1);
+     b->last = ngx_sprintf(b->last, "%ui", (ngx_uint_t) s->out_bytes);
+ 
+-    if (args_len) {
+-        *b->last++ = '&';
+-        b->last = (u_char *) ngx_cpymem(b->last, ctx->args, args_len);
+-    }
++    *b->last++ = '&';
+ 
+     return ngx_rtmp_notify_create_request(s, pool, NGX_RTMP_NOTIFY_RECORD_DONE,
+                                           pl);
+@@ -892,12 +987,11 @@ ngx_rtmp_notify_playlist_create(ngx_rtmp_session_t *s, void *arg,
+     name_len  = ngx_strlen(ctx->name);
+ 
+     b = ngx_create_temp_buf(pool,
+-            sizeof("&call=playlist") +
++            sizeof("call=playlist") +
+             sizeof("&module=") + v->module.len +
+-            sizeof("&app=") + s->app.len * 3 +
+             sizeof("&name=") + name_len * 3 +
+             sizeof("&path=") + v->playlist.len * 3 +
+-            1);
++            1 + 1);
+ 
+     if (b == NULL) {
+         return NULL;
+@@ -906,18 +1000,14 @@ ngx_rtmp_notify_playlist_create(ngx_rtmp_session_t *s, void *arg,
+     pl->buf = b;
+     pl->next = NULL;
+ 
+-    b->last = ngx_cpymem(b->last, (u_char*) "&call=playlist",
+-                         sizeof("&call=playlist") - 1);
++    b->last = ngx_cpymem(b->last, (u_char*) "call=playlist",
++                         sizeof("call=playlist") - 1);
+ 
+     b->last = ngx_cpymem(b->last, (u_char *) "&module=",
+                          sizeof("&module=") - 1);
+     b->last = (u_char*) ngx_escape_uri(b->last, v->module.data,
+                                        v->module.len, NGX_ESCAPE_ARGS);
+ 
+-    b->last = ngx_cpymem(b->last, (u_char*) "&app=", sizeof("&app=") - 1);
+-    b->last = (u_char*) ngx_escape_uri(b->last, s->app.data, s->app.len,
+-                                       NGX_ESCAPE_ARGS);
+-
+     b->last = ngx_cpymem(b->last, (u_char*) "&name=", sizeof("&name=") - 1);
+     b->last = (u_char*) ngx_escape_uri(b->last, ctx->name, name_len,
+                                        NGX_ESCAPE_ARGS);
+@@ -926,6 +1016,8 @@ ngx_rtmp_notify_playlist_create(ngx_rtmp_session_t *s, void *arg,
+     b->last = (u_char*) ngx_escape_uri(b->last, v->playlist.data, v->playlist.len,
+                                        NGX_ESCAPE_ARGS);
+ 
++    *b->last++ = '&';
++
+     return ngx_rtmp_notify_create_request(s, pool, NGX_RTMP_NOTIFY_PLAYLIST,
+                                           pl);
+ }
+@@ -1428,14 +1520,57 @@ ngx_rtmp_notify_play_handle(ngx_rtmp_session_t *s,
+     if (ngx_strncasecmp(name, (u_char *) "rtmp://", 7)) {
+         *ngx_cpymem(v->name, name, rc) = 0;
+         ngx_log_error(NGX_LOG_INFO, s->connection->log, 0,
+-                      "notify: play redirect to '%s'", v->name);
++                      "notify: play internal redirect to '%s'", v->name);
+         goto next;
+     }
+ 
+     /* pull */
+ 
+     nacf = ngx_rtmp_get_module_app_conf(s, ngx_rtmp_notify_module);
+-    if (nacf->relay_redirect) {
++    if (nacf->send_redirect) {
++        // Send 302 redirect and go next
++
++        ngx_log_error(NGX_LOG_INFO, s->connection->log, 0,
++                  "notify: play send 302 redirect");
++        ngx_log_error(NGX_LOG_INFO, s->connection->log, 0,
++                  "notify: -- for stream '%s' to new location '%*s'", v->name, rc, name);
++
++        local_name.data = ngx_palloc(s->connection->pool, rc+1);
++        local_name.len = rc;
++        *ngx_cpymem(local_name.data, name, rc) = 0;
++
++        /* MAGICK HERE */
++
++        if (!ngx_strncasecmp(s->flashver.data, (u_char *) "FMLE/", 5)) {
++            // Official method, by FMS SDK
++            send = ngx_rtmp_send_redirect_status(s, "onStatus", "Connect here", local_name);
++            send &= ngx_rtmp_send_redirect_status(s, "netStatus", "Connect here", local_name);
++
++            ngx_log_error(NGX_LOG_INFO, s->connection->log, 0,
++                      "notify: play send(o) status = '%ui'", send == NGX_OK);
++        } else {
++
++            // Something by rtmpdump lib
++            send = ngx_rtmp_send_redirect_status(s, "_error", "Connect here", local_name);
++
++            ngx_log_error(NGX_LOG_INFO, s->connection->log, 0,
++                      "notify: play send(e) status = '%ui'", send == NGX_OK);
++        }
++
++        ngx_pfree(s->connection->pool, local_name.data);
++
++        ngx_rtmp_notify_clear_flag(s, NGX_RTMP_NOTIFY_PLAYING);
++
++        // Something by rtmpdump lib
++        send = ngx_rtmp_send_close_method(s, "close");
++        ngx_log_error(NGX_LOG_INFO, s->connection->log, 0,
++            "notify: play send(e) close method = '%ui'", send == NGX_OK);
++
++        return send;
++
++    } else if (nacf->relay_redirect) {
++        // Relay local streams, change name
++
+         ngx_rtmp_notify_set_name(v->name, NGX_RTMP_MAX_NAME, name, (size_t) rc);
+     }
+ 
+@@ -1483,7 +1618,7 @@ ngx_rtmp_notify_update_handle(ngx_rtmp_session_t *s,
+ 
+     rc = ngx_rtmp_notify_parse_http_retcode(s, in);
+ 
+-    if ((!nacf->update_strict && rc == NGX_ERROR) ||
++    if ((!nacf->update_strict && (rc == NGX_ERROR || rc == NGX_DECLINED) ) ||
+          (nacf->update_strict && rc != NGX_OK))
+     {
+         ngx_log_error(NGX_LOG_INFO, s->connection->log, 0,
+@@ -1801,6 +1936,39 @@ ngx_rtmp_notify_close_stream(ngx_rtmp_session_t *s,
+ 
+ 
+ static ngx_int_t
++ngx_rtmp_notify_record_started(ngx_rtmp_session_t *s, ngx_rtmp_record_started_t *v)
++{
++    ngx_rtmp_netcall_init_t         ci;
++    ngx_rtmp_notify_app_conf_t     *nacf;
++
++    if (s->auto_pushed) {
++        goto next;
++    }
++
++    nacf = ngx_rtmp_get_module_app_conf(s, ngx_rtmp_notify_module);
++    if (nacf == NULL || nacf->url[NGX_RTMP_NOTIFY_RECORD_STARTED] == NULL) {
++        goto next;
++    }
++
++    ngx_log_error(NGX_LOG_INFO, s->connection->log, 0,
++                  "notify: record_started recorder=%V path='%V' url='%V'",
++                  &v->recorder, &v->path,
++                  &nacf->url[NGX_RTMP_NOTIFY_RECORD_STARTED]->url);
++
++    ngx_memzero(&ci, sizeof(ci));
++
++    ci.url    = nacf->url[NGX_RTMP_NOTIFY_RECORD_STARTED];
++    ci.create = ngx_rtmp_notify_record_started_create;
++    ci.arg    = v;
++
++    ngx_rtmp_netcall_create(s, &ci);
++    
++next:
++    return next_record_started(s, v); 
++}
++
++
++static ngx_int_t
+ ngx_rtmp_notify_record_done(ngx_rtmp_session_t *s, ngx_rtmp_record_done_t *v)
+ {
+     ngx_rtmp_netcall_init_t         ci;
+@@ -2008,6 +2176,10 @@ ngx_rtmp_notify_on_app_event(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+             n = NGX_RTMP_NOTIFY_PLAY_DONE;
+             break;
+ 
++        case sizeof("on_record_started") - 1:
++            n = NGX_RTMP_NOTIFY_RECORD_STARTED;
++            break;
++
+         case sizeof("on_record_done") - 1:
+             n = NGX_RTMP_NOTIFY_RECORD_DONE;
+             break;
+@@ -2104,6 +2276,9 @@ ngx_rtmp_notify_postconfiguration(ngx_conf_t *cf)
+     next_close_stream = ngx_rtmp_close_stream;
+     ngx_rtmp_close_stream = ngx_rtmp_notify_close_stream;
+ 
++    next_record_started = ngx_rtmp_record_started;
++    ngx_rtmp_record_started = ngx_rtmp_notify_record_started;
++
+     next_record_done = ngx_rtmp_record_done;
+     ngx_rtmp_record_done = ngx_rtmp_notify_record_done;
+ 
+diff --git a/ngx_rtmp_record_module.c b/ngx_rtmp_record_module.c
+index b884b2aa..c7db8edf 100644
+--- a/ngx_rtmp_record_module.c
++++ b/ngx_rtmp_record_module.c
+@@ -13,6 +13,7 @@
+ #include "ngx_rtmp_record_module.h"
+ 
+ 
++ngx_rtmp_record_started_pt          ngx_rtmp_record_started;
+ ngx_rtmp_record_done_pt             ngx_rtmp_record_done;
+ 
+ 
+@@ -112,7 +113,7 @@ static ngx_command_t  ngx_rtmp_record_commands[] = {
+ 
+     { ngx_string("record_interval_size"),
+       NGX_RTMP_MAIN_CONF|NGX_RTMP_SRV_CONF|NGX_RTMP_APP_CONF|
+-			NGX_RTMP_REC_CONF|NGX_CONF_TAKE1,
++                        NGX_RTMP_REC_CONF|NGX_CONF_TAKE1,
+       ngx_conf_set_size_slot,
+       NGX_RTMP_APP_CONF_OFFSET,
+       offsetof(ngx_rtmp_record_app_conf_t, interval_size),
+@@ -856,6 +857,8 @@ ngx_rtmp_record_node_close(ngx_rtmp_session_t *s,
+     v.recorder = rracf->id;
+     ngx_rtmp_record_make_path(s, rctx, &v.path);
+ 
++    rctx->record_started = 0;
++
+     rc = ngx_rtmp_record_done(s, &v);
+ 
+     s->app_conf = app_conf;
+@@ -905,6 +908,21 @@ ngx_rtmp_record_write_frame(ngx_rtmp_session_t *s,
+         rctx->audio = 1;
+     }
+ 
++    if (rctx->record_started == 0)
++    {
++        rctx->record_started = 1;
++
++        ngx_rtmp_record_started_t       v;
++        ngx_rtmp_record_app_conf_t     *racf;
++        racf = ngx_rtmp_get_module_app_conf(s, ngx_rtmp_record_module);
++
++        if (racf != NULL && racf->rec.nelts != 0) {
++            v.recorder = racf->id;
++            v.path = racf->path;
++            ngx_rtmp_record_started(s, &v);
++        }
++    }
++
+     timestamp = h->timestamp - rctx->epoch;
+ 
+     if ((int32_t) timestamp < 0) {
+@@ -990,14 +1008,6 @@ ngx_rtmp_record_write_frame(ngx_rtmp_session_t *s,
+         ngx_rtmp_record_node_close(s, rctx);
+     }
+ 
+-    /* watch size interval */
+-    if ((rracf->interval_size && rctx->file.offset >= (ngx_int_t) rracf->interval_size) ||
+-        (rracf->max_frames && rctx->nframes >= rracf->max_frames))
+-    {
+-	ngx_rtmp_record_node_close(s, rctx);
+-	ngx_rtmp_record_node_open(s, rctx);
+-    }
+-
+     return NGX_OK;
+ }
+ 
+@@ -1070,9 +1080,9 @@ ngx_rtmp_record_node_avd(ngx_rtmp_session_t *s, ngx_rtmp_record_rec_ctx_t *rctx,
+         return NGX_OK;
+     }
+ 
+-    if (rctx->file.fd == NGX_INVALID_FILE) {
++    /*if (rctx->file.fd == NGX_INVALID_FILE) {
+         return NGX_OK;
+-    }
++    }*/
+ 
+     if (h->type == NGX_RTMP_MSG_AUDIO &&
+        (rracf->flags & NGX_RTMP_RECORD_AUDIO) == 0)
+@@ -1093,9 +1103,9 @@ ngx_rtmp_record_node_avd(ngx_rtmp_session_t *s, ngx_rtmp_record_rec_ctx_t *rctx,
+         return NGX_OK;
+     }
+ 
+-    // record interval should work if set, manual mode or not
+-    if (rracf->interval != (ngx_msec_t) NGX_CONF_UNSET) {
+-
++    if (rracf->interval != NGX_CONF_UNSET_MSEC)
++    {
++	// record interval should work if set, manual mode or not
+         next = rctx->last;
+         next.msec += rracf->interval;
+         next.sec  += (next.msec / 1000);
+@@ -1104,12 +1114,13 @@ ngx_rtmp_record_node_avd(ngx_rtmp_session_t *s, ngx_rtmp_record_rec_ctx_t *rctx,
+         if (ngx_cached_time->sec  > next.sec ||
+            (ngx_cached_time->sec == next.sec &&
+            ngx_cached_time->msec > next.msec))
+-        {
+-            ngx_rtmp_record_node_close(s, rctx);
+-            ngx_rtmp_record_node_open(s, rctx);
+-        }
+-
+-    } else if (!rctx->failed) {
++            {
++		ngx_rtmp_record_node_close(s, rctx);
++                ngx_rtmp_record_node_open(s, rctx);
++            }
++    }
++    else if (!rctx->failed)
++    {
+         ngx_rtmp_record_node_open(s, rctx);
+     }
+ 
+@@ -1209,6 +1220,12 @@ ngx_rtmp_record_node_avd(ngx_rtmp_session_t *s, ngx_rtmp_record_rec_ctx_t *rctx,
+ 
+ 
+ static ngx_int_t
++ngx_rtmp_record_started_init(ngx_rtmp_session_t *s, ngx_rtmp_record_started_t *v)
++{
++    return NGX_OK;
++}
++
++static ngx_int_t
+ ngx_rtmp_record_done_init(ngx_rtmp_session_t *s, ngx_rtmp_record_done_t *v)
+ {
+     return NGX_OK;
+@@ -1222,6 +1239,7 @@ ngx_rtmp_record_recorder(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+     ngx_int_t                   i;
+     ngx_str_t                  *value;
+     ngx_conf_t                  save;
++    ngx_module_t              **modules;
+     ngx_rtmp_module_t          *module;
+     ngx_rtmp_core_app_conf_t   *cacf, **pcacf, *rcacf;
+     ngx_rtmp_record_app_conf_t *racf, **pracf, *rracf;
+@@ -1248,17 +1266,22 @@ ngx_rtmp_record_recorder(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+         return NGX_CONF_ERROR;
+     }
+ 
+-    for (i = 0; ngx_modules[i]; i++) {
+-        if (ngx_modules[i]->type != NGX_RTMP_MODULE) {
++#if defined(nginx_version) && nginx_version >= 1009011
++    modules = cf->cycle->modules;
++#else
++    modules = ngx_modules;
++#endif
++    for (i = 0; modules[i]; i++) {
++        if (modules[i]->type != NGX_RTMP_MODULE) {
+             continue;
+         }
+ 
+-        module = ngx_modules[i]->ctx;
++        module = modules[i]->ctx;
+ 
+         if (module->create_app_conf) {
+-            ctx->app_conf[ngx_modules[i]->ctx_index] =
++            ctx->app_conf[modules[i]->ctx_index] =
+                                 module->create_app_conf(cf);
+-            if (ctx->app_conf[ngx_modules[i]->ctx_index] == NULL) {
++            if (ctx->app_conf[modules[i]->ctx_index] == NULL) {
+                 return NGX_CONF_ERROR;
+             }
+         }
+@@ -1302,6 +1325,8 @@ ngx_rtmp_record_postconfiguration(ngx_conf_t *cf)
+     ngx_rtmp_core_main_conf_t          *cmcf;
+     ngx_rtmp_handler_pt                *h;
+ 
++    ngx_rtmp_record_started = ngx_rtmp_record_started_init;
++
+     ngx_rtmp_record_done = ngx_rtmp_record_done_init;
+ 
+     cmcf = ngx_rtmp_conf_get_module_main_conf(cf, ngx_rtmp_core_module);
+diff --git a/ngx_rtmp_record_module.h b/ngx_rtmp_record_module.h
+index d9223e5a..a1a9706c 100644
+--- a/ngx_rtmp_record_module.h
++++ b/ngx_rtmp_record_module.h
+@@ -54,6 +54,7 @@ typedef struct {
+     unsigned                            video_key_sent:1;
+     unsigned                            audio:1;
+     unsigned                            video:1;
++    unsigned                            record_started:1;
+ } ngx_rtmp_record_rec_ctx_t;
+ 
+ 
+@@ -84,10 +85,23 @@ typedef struct {
+ } ngx_rtmp_record_done_t;
+ 
+ 
++typedef struct {
++    ngx_str_t                           recorder;
++    ngx_str_t                           path;
++} ngx_rtmp_record_started_t;
++
++
++typedef ngx_int_t (*ngx_rtmp_record_started_pt)(ngx_rtmp_session_t *s,
++        ngx_rtmp_record_started_t *v);
++
++
+ typedef ngx_int_t (*ngx_rtmp_record_done_pt)(ngx_rtmp_session_t *s,
+         ngx_rtmp_record_done_t *v);
+ 
+ 
++extern ngx_rtmp_record_started_pt       ngx_rtmp_record_started;
++
++
+ extern ngx_rtmp_record_done_pt          ngx_rtmp_record_done;
+ 
+ 
+diff --git a/ngx_rtmp_shared.c b/ngx_rtmp_shared.c
+index 6f6e4e8d..3bdc5bee 100644
+--- a/ngx_rtmp_shared.c
++++ b/ngx_rtmp_shared.c
+@@ -66,7 +66,8 @@ ngx_rtmp_free_shared_chain(ngx_rtmp_core_srv_conf_t *cscf, ngx_chain_t *in)
+     }
+ 
+     for (cl = in; ; cl = cl->next) {
+-        if (cl->next == NULL) {
++        /* FIXME: Don't create circular chains in the first place */
++        if (cl->next == NULL || cl->next == in) {
+             cl->next = cscf->free;
+             cscf->free = in;
+             return;
+diff --git a/ngx_rtmp_version.h b/ngx_rtmp_version.h
+index cbfa3df6..2aebec70 100644
+--- a/ngx_rtmp_version.h
++++ b/ngx_rtmp_version.h
+@@ -9,7 +9,7 @@
+ 
+ 
+ #define nginx_rtmp_version  1001007
+-#define NGINX_RTMP_VERSION  "1.1.7.10"
++#define NGINX_RTMP_VERSION  "1.1.7.11-dev"
+ 
+ 
+ #endif /* _NGX_RTMP_VERSION_H_INCLUDED_ */
+
